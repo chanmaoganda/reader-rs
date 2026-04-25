@@ -6,9 +6,11 @@
 //!
 //! See `.trellis/spec/backend/error-handling.md`.
 
+use std::path::PathBuf;
+
 /// Errors produced by the `reader-rs` library.
 ///
-/// New variants will be added as PR2+ land (IO, parse, layout). The enum is
+/// New variants will be added as PR3+ land (layout, persistence). The enum is
 /// `#[non_exhaustive]` so adding a variant is not a breaking change.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -16,6 +18,48 @@ pub enum Error {
     /// The GUI runtime failed to start or exited with an error.
     #[error("UI runtime error: {0}")]
     Ui(String),
+
+    /// I/O failure while reading an EPUB from disk.
+    #[error("failed to open EPUB at {path}")]
+    Io {
+        /// Path to the EPUB file we attempted to open.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The EPUB at `path` is malformed and could not be parsed.
+    #[error("failed to parse EPUB at {path}: {message}")]
+    Parse {
+        /// Path to the EPUB file we attempted to parse.
+        path: PathBuf,
+        /// Human-readable explanation of what went wrong.
+        message: String,
+    },
+
+    /// A chapter's bytes were not valid UTF-8.
+    #[error("EPUB chapter at index {index} contains invalid UTF-8")]
+    InvalidUtf8 {
+        /// Spine index of the offending chapter.
+        index: usize,
+    },
+
+    /// Caller asked for a chapter index outside the spine.
+    #[error("EPUB chapter index {index} is out of range (spine length {len})")]
+    InvalidChapter {
+        /// The requested (out-of-range) index.
+        index: usize,
+        /// The actual length of the spine.
+        len: usize,
+    },
+
+    /// A resource referenced by the EPUB could not be found inside the archive.
+    #[error("EPUB resource not found: {path}")]
+    MissingResource {
+        /// The resource path that was not found.
+        path: String,
+    },
 }
 
 /// Convenience alias for `Result<T, Error>`.

@@ -2772,11 +2772,13 @@ dependencies = [
  "directories",
  "epub",
  "iced",
+ "reader-rs",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

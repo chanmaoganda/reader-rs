@@ -7,19 +7,24 @@
 //! Module layout (see `.trellis/spec/backend/directory-structure.md`):
 //!
 //! - [`error`] — crate-level error type and `Result` alias.
-//! - `format` — book format loaders (EPUB first; populated in PR2).
+//! - [`mod@format`] — book format loaders (EPUB shipped in PR2).
 //! - `layout` — XHTML/CSS-subset layout engine (PR3).
 //! - `persistence` — recents and per-book reading position (PR5).
 //! - `ui` — `iced` application shell (PR1 stub; reader view in PR4).
 
 pub mod error;
+pub mod format;
 
-mod format;
 mod layout;
 mod persistence;
 mod ui;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
 pub use error::{Error, Result};
+pub use format::{BookSource, EpubSource};
 
 /// Boot the reader's UI event loop and run until the user closes the window.
 ///
