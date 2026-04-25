@@ -4,3 +4,4 @@
 {"file": ".trellis/spec/backend/error-handling.md", "reason": "Crate Error enum (thiserror) is part of PR1; rules on Result, no unwrap, anyhow only in main"}
 {"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "tracing init in main is part of PR1"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Forbidden patterns + clippy gate apply on every PR"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Layout has multiple parsers/cascades; reuse-thinking matters"}

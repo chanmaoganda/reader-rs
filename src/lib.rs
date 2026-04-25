@@ -14,8 +14,8 @@
 
 pub mod error;
 pub mod format;
+pub mod layout;
 
-mod layout;
 mod persistence;
 mod ui;
 

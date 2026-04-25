@@ -4,3 +4,4 @@
 {"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify error type and propagation rules"}
 {"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Verify tracing usage; no println for diagnostics"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Run clippy/fmt/test gate"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Same"}

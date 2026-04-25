@@ -2773,6 +2773,7 @@ dependencies = [
  "epub",
  "iced",
  "reader-rs",
+ "roxmltree",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

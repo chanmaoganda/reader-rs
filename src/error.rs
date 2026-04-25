@@ -60,6 +60,13 @@ pub enum Error {
         /// The resource path that was not found.
         path: String,
     },
+
+    /// Failed to parse a chapter's XHTML in the layout engine.
+    #[error("failed to parse chapter XHTML: {message}")]
+    LayoutParse {
+        /// Human-readable explanation from the underlying XML parser.
+        message: String,
+    },
 }
 
 /// Convenience alias for `Result<T, Error>`.
