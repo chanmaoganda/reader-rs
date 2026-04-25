@@ -1,6 +1,6 @@
 //! Styled-tree → cosmic-text Buffers → pages.
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
+use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight};
 
 use super::parse::{Block, parse_chapter};
 use super::style::TextAlign;
@@ -47,7 +47,7 @@ fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> Block
     let mut buffer = Buffer::new(font_system, metrics);
     buffer.set_size(Some(width), None);
 
-    let default_attrs = Attrs::new()
+    let mut default_attrs = Attrs::new()
         .family(Family::Name(&block.style.font_family))
         .weight(Weight(block.style.weight))
         .style(if block.style.italic {
@@ -55,6 +55,9 @@ fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> Block
         } else {
             Style::Normal
         });
+    if let Some((r, g, b)) = block.style.color {
+        default_attrs = default_attrs.color(Color::rgb(r, g, b));
+    }
 
     let alignment = match block.style.align {
         TextAlign::Start => None,
@@ -84,7 +87,7 @@ fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> Block
             .iter()
             .zip(families.iter())
             .map(|(run, fam)| {
-                let attrs = Attrs::new()
+                let mut attrs = Attrs::new()
                     .family(Family::Name(fam))
                     .weight(Weight(run.style.weight))
                     .style(if run.style.italic {
@@ -92,6 +95,9 @@ fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> Block
                     } else {
                         Style::Normal
                     });
+                if let Some((r, g, b)) = run.style.color {
+                    attrs = attrs.color(Color::rgb(r, g, b));
+                }
                 (run.text.as_str(), attrs)
             })
             .collect();

@@ -21,7 +21,7 @@ mod paginate;
 mod parse;
 mod style;
 
-pub use cosmic_text::FontSystem;
+pub use cosmic_text::{Color, FontSystem};
 
 use crate::Result;
 use crate::format::ChapterContent;
@@ -38,6 +38,10 @@ pub struct Viewport {
 /// Typography knobs applied to every chapter pre-cascade.
 ///
 /// These are the user-controlled defaults; per-element CSS overrides them.
+///
+/// Colors are consumed by the renderer (PR4) — pagination / shaping does not
+/// depend on them, but they live here so a single value flows from the UI
+/// to the pixels.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Theme {
@@ -50,16 +54,54 @@ pub struct Theme {
     pub line_height: f32,
     /// Page margin (px) applied to all four sides.
     pub page_margin: f32,
+    /// Default text color, used when no per-run CSS `color` overrides it.
+    pub fg_color: Color,
+    /// Page background color. Painted by the renderer; pagination ignores it.
+    pub bg_color: Color,
+    /// Color applied to heading blocks (h1–h6) when no explicit `color` is set.
+    pub heading_color: Color,
+    /// Color used for muted / secondary text (blockquote, captions). Reserved
+    /// for the CSS cascade to consult once it learns to differentiate.
+    pub muted_color: Color,
 }
 
-impl Default for Theme {
-    fn default() -> Self {
+impl Theme {
+    /// Warm-paper-on-near-black palette for long evening reads.
+    ///
+    /// Default for the application; see PRD §"dark theme by default".
+    #[must_use]
+    pub fn dark() -> Self {
         Self {
             font_family: "Sans-Serif".to_owned(),
             base_font_size: 16.0,
             line_height: 1.4,
             page_margin: 24.0,
+            fg_color: Color::rgb(0xd4, 0xcf, 0xc6),
+            bg_color: Color::rgb(0x1c, 0x1b, 0x1a),
+            heading_color: Color::rgb(0xe8, 0xe2, 0xd6),
+            muted_color: Color::rgb(0x8a, 0x83, 0x78),
         }
+    }
+
+    /// Black-on-white classic palette.
+    #[must_use]
+    pub fn light() -> Self {
+        Self {
+            font_family: "Sans-Serif".to_owned(),
+            base_font_size: 16.0,
+            line_height: 1.4,
+            page_margin: 24.0,
+            fg_color: Color::rgb(0x1c, 0x1b, 0x1a),
+            bg_color: Color::rgb(0xfa, 0xf8, 0xf2),
+            heading_color: Color::rgb(0x10, 0x10, 0x10),
+            muted_color: Color::rgb(0x60, 0x5a, 0x52),
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::dark()
     }
 }
 
@@ -88,6 +130,12 @@ impl LaidOutChapter {
     pub fn page(&self, index: usize) -> Option<&Page> {
         self.pages.get(index)
     }
+
+    /// Internal accessor used by the renderer to walk shaped blocks.
+    #[must_use]
+    pub(crate) fn blocks(&self) -> &[BlockBuffer] {
+        &self.blocks
+    }
 }
 
 /// One paginated block within the chapter — a shaped paragraph plus the
@@ -97,8 +145,8 @@ pub(crate) struct BlockBuffer {
     /// The shaped buffer. Holds all lines for this block.
     pub(crate) buffer: cosmic_text::Buffer,
     /// Total visual height of the block in logical pixels (sum of line
-    /// heights). Computed once at shape time. PR4 will use this when
-    /// painting; PR3 keeps it on the struct so we don't recompute later.
+    /// heights). Computed once at shape time. PR4 reads it via
+    /// [`BlockBuffer::total_height`] when laying images out vertically.
     #[allow(dead_code, reason = "consumed by PR4's paint path")]
     pub(crate) total_height: f32,
     /// Margin above the block (px), applied before the first slice on a
@@ -106,6 +154,14 @@ pub(crate) struct BlockBuffer {
     pub(crate) margin_top: f32,
     /// Margin below the block (px), applied after the last slice on a page.
     pub(crate) margin_bottom: f32,
+}
+
+impl BlockBuffer {
+    /// Internal accessor used by the renderer to walk shaped lines.
+    #[must_use]
+    pub(crate) fn buffer(&self) -> &cosmic_text::Buffer {
+        &self.buffer
+    }
 }
 
 /// A reference to a slice of one block's shaped lines, positioned on a

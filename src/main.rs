@@ -15,6 +15,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    reader_rs::run().context("running reader-rs")?;
+    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
+    reader_rs::run_with_optional_path(path).context("running reader-rs")?;
     Ok(())
 }

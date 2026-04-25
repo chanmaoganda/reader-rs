@@ -67,6 +67,11 @@ pub enum Error {
         /// Human-readable explanation from the underlying XML parser.
         message: String,
     },
+
+    /// The background pagination worker died before returning a response,
+    /// or its outbound channel was closed unexpectedly.
+    #[error("background worker failed: {0}")]
+    Worker(String),
 }
 
 /// Convenience alias for `Result<T, Error>`.

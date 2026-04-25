@@ -11,8 +11,9 @@
 //!
 //! Per the PRD: this is the gate for "no tofu on the canonical EPUB".
 
+use reader_rs::bench::{SwashCache, render_page_for_bench};
 use reader_rs::format::{BookSource, EpubSource};
-use reader_rs::layout::{paginate, FontSystem, Theme, Viewport};
+use reader_rs::layout::{FontSystem, Theme, Viewport, paginate};
 
 #[test]
 fn paginates_each_chapter_of_fixture() {
@@ -127,4 +128,72 @@ fn paginates_canonical_cjk_epub() {
         }
     }
     eprintln!("total pages: {total_pages}, slowest chapter: {max_chapter_ms} ms");
+}
+
+/// Rasterize a real page from the canonical CJK EPUB end-to-end (paginate
+/// → render). The only way to verify the full PR4 pipeline against the
+/// user's actual file without a display server. Skipped by default.
+#[test]
+#[ignore = "requires the user's local canonical EPUB; run with --ignored"]
+fn rasterizes_canonical_cjk_page() {
+    let path = "/home/ethan/Documents/china-in-map/《地图中的中国通史》[上下册].epub";
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+
+    let mut book = EpubSource::open(path).expect("open canonical");
+    let viewport = Viewport {
+        width: 800.0,
+        height: 1200.0,
+    };
+    let theme = Theme::dark();
+    let mut font_system = FontSystem::new();
+    let mut swash_cache = SwashCache::new();
+
+    // Find the first chapter that yields >=1 page (ch000 is empty in this
+    // EPUB; PR3 confirmed).
+    let spine_len = book.spine().len();
+    let mut rendered = None;
+    for i in 0..spine_len.min(10) {
+        let chapter = book.chapter(i).expect("chapter");
+        let out = paginate(&chapter, viewport, &theme, &mut font_system).expect("paginate");
+        if out.page_count() == 0 {
+            continue;
+        }
+        let page = out.page(0).expect("page 0");
+        let start = std::time::Instant::now();
+        let img = render_page_for_bench(
+            page,
+            &out,
+            viewport,
+            &theme,
+            &mut font_system,
+            &mut swash_cache,
+        );
+        let elapsed = start.elapsed();
+        rendered = Some((i, img, elapsed));
+        break;
+    }
+    let (chapter_index, img, elapsed) =
+        rendered.expect("at least one non-empty chapter in first 10");
+
+    assert_eq!(img.width, 800);
+    assert_eq!(img.height, 1200);
+    assert_eq!(img.pixels.len(), 800 * 1200 * 4);
+
+    let bg = theme.bg_color.as_rgba_tuple();
+    let non_bg = img
+        .pixels
+        .chunks_exact(4)
+        .filter(|c| c[0] != bg.0 || c[1] != bg.1 || c[2] != bg.2)
+        .count();
+    assert!(
+        non_bg > 0,
+        "rasterized canonical CJK page should contain non-bg pixels"
+    );
+
+    eprintln!(
+        "canonical ch{chapter_index} page 0 rasterized in {} µs ({non_bg} non-bg pixels)",
+        elapsed.as_micros()
+    );
 }
