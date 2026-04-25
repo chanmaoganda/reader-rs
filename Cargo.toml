@@ -1,0 +1,23 @@
+[package]
+name = "reader-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = "0.14"
+cosmic-text = "0.19"
+epub = "2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "page_turn"
+harness = false
