@@ -10,7 +10,6 @@ edition = "2024"
 test-support = ["dep:zip"]
 
 [dependencies]
-bytes = "1"
 iced = { version = "0.14", features = ["image", "tokio"] }
 cosmic-text = "0.19"
 epub = "2.1"

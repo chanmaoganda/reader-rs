@@ -33,19 +33,29 @@ pub(crate) struct PageImage {
 
 /// Render `page` from `chapter` into an RGBA8 pixel buffer.
 ///
-/// The result has size `viewport.width × viewport.height` (rounded to whole
-/// pixels). Glyphs are rasterized into the buffer one at a time, blending
-/// the foreground color over the background using the swash mask alpha.
+/// `scale` controls pixel density: with `scale = 1.0` the result has
+/// dimensions `viewport.width × viewport.height` (logical pixels). Larger
+/// values rasterize at higher resolution so HiDPI displays don't have to
+/// upsample — at `scale = 2.0` you get a 2x texture that, when fitted into
+/// a `viewport`-sized logical area, maps 1:1 to physical pixels on a 2x
+/// display. Glyphs are re-rasterized at the requested scale via
+/// [`cosmic_text::LayoutGlyph::physical`], so they stay crisp.
+///
+/// Layout (line breaks, page boundaries) is unchanged by `scale` — that
+/// happened in PR3 against the unscaled viewport. This function only
+/// affects how many output pixels the page occupies.
 pub(crate) fn render_page(
     page: &Page,
     chapter: &LaidOutChapter,
     viewport: Viewport,
     theme: &Theme,
+    scale: f32,
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
 ) -> PageImage {
-    let width = viewport.width.max(1.0) as u32;
-    let height = viewport.height.max(1.0) as u32;
+    let scale = scale.max(0.1);
+    let width = (viewport.width.max(1.0) * scale) as u32;
+    let height = (viewport.height.max(1.0) * scale) as u32;
     let mut img = PageImage {
         width,
         height,
@@ -78,13 +88,15 @@ pub(crate) fn render_page(
             // y=0 of the slice, and subsequent lines stack relative to it.
             let block_top = *block_top.get_or_insert(run.line_top);
             let line_top_within_slice = run.line_top - block_top;
-            // Baseline-to-top distance for this line.
+            // Baseline-to-top distance for this line — still in the layout's
+            // logical units; cosmic-text's `physical(..., scale)` multiplies
+            // it through to physical pixel coordinates.
             let baseline_y =
                 margin + slice.y_offset + (run.line_y - run.line_top) + line_top_within_slice;
             let pen_x = margin;
 
             for glyph in run.glyphs {
-                let physical = glyph.physical((pen_x, baseline_y), 1.0);
+                let physical = glyph.physical((pen_x, baseline_y), scale);
                 let glyph_color = glyph.color_opt.unwrap_or(default_color);
                 draw_glyph(
                     &mut img,
@@ -274,7 +286,7 @@ mod tests {
         let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
         assert!(out.page_count() >= 1);
         let page = out.page(0).expect("page 0");
-        let img = render_page(page, &out, viewport, &theme, &mut fs, &mut cache);
+        let img = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);
 
         assert_eq!(img.width, 400);
         assert_eq!(img.height, 600);
@@ -307,7 +319,7 @@ mod tests {
         );
         let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
         let page = out.page(0).expect("page 0");
-        let img = render_page(page, &out, viewport, &theme, &mut fs, &mut cache);
+        let img = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);
         let bg = theme.bg_color.as_rgba_tuple();
         let any_fg = img
             .pixels

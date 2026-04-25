@@ -38,6 +38,12 @@ const DEFAULT_VIEWPORT: Viewport = Viewport {
 /// Approximate frame-pacing tick used by the response-poll subscription.
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
+/// Pixel-density multiplier for rasterized pages. The layout viewport is in
+/// logical pixels; we render the texture at `viewport * RENDER_SCALE` so
+/// HiDPI displays don't have to upsample our buffer (which produced visible
+/// blur at 1.0). PR4.5 will read the actual `scale_factor` from iced.
+const RENDER_SCALE: f32 = 2.0;
+
 /// Per-chapter state on the UI side.
 enum ChapterState {
     NotRequested,
@@ -60,11 +66,12 @@ struct OpenBook {
 struct CachedPage {
     chapter_index: usize,
     page_in_chapter: usize,
-    width: u32,
-    height: u32,
-    /// Reference-counted pixel buffer. Cloning the inner `Bytes` per
-    /// `view()` is an `Arc` increment, not a copy of the ~3.8 MB buffer.
-    pixels: bytes::Bytes,
+    /// The iced `Handle` built from the rasterized buffer. We store the
+    /// Handle itself (not the raw bytes) so its internal id stays stable
+    /// across `view()` calls; otherwise iced sees a "different" texture
+    /// every frame, re-uploads to the GPU, and the picture flickers.
+    /// Handle is internally `Arc`-shared; `clone` is cheap.
+    handle: Handle,
 }
 
 struct App {
@@ -228,6 +235,12 @@ fn drain_worker(app: &mut App) {
     // After draining, walk forward over empty/failed chapters until we find
     // one with at least one page. This is the "skip empty ch000" behaviour.
     advance_past_empty(book);
+    // advance_past_empty may have landed us on a NotRequested chapter
+    // (e.g. canonical EPUB: ch000 is empty so we move to ch001 which was
+    // never requested). Without this, the UI sticks on "paginating…".
+    if book.current_chapter < book.chapters.len() {
+        request_chapter(book, book.current_chapter, &theme);
+    }
     // Invalidate cache; renderer will re-rasterize on next view.
     book.cached = None;
     // Prefetch next chapter once the current one is loaded.
@@ -387,15 +400,16 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         return reader::empty_view("(no page)");
     }
 
-    // Rasterization happens in `ensure_cache` from `update_with_cache` —
-    // `view` only stages the cached pixel buffer into a `Handle`. The
-    // `Bytes::clone` below is an `Arc` increment, not a buffer copy.
+    // Rasterization happens in `ensure_cache` from `update_with_cache`.
+    // `view` is called every frame; we MUST return the same `Handle` (with
+    // the same internal id) when the page hasn't changed, otherwise iced
+    // re-uploads the texture and the picture flickers.
     let cached = book.cached.as_ref().filter(|c| {
         c.chapter_index == book.current_chapter && c.page_in_chapter == book.current_page_in_chapter
     });
     let handle = match cached {
-        // `Bytes::clone` is an `Arc` increment, not a copy of the pixel buffer.
-        Some(c) => Handle::from_rgba(c.width, c.height, c.pixels.clone()),
+        // Handle is internally `Arc`-shared; cloning is cheap and preserves the id.
+        Some(c) => c.handle.clone(),
         None => {
             // No cache yet — paint a flat background. `ensure_cache` runs
             // from `update_with_cache` before view, so this path only fires
@@ -466,16 +480,18 @@ fn ensure_cache(app: &mut App) {
         &chapter,
         viewport,
         &theme,
+        RENDER_SCALE,
         &mut app.font_system,
         &mut app.swash_cache,
     );
     if let Some(book) = app.book.as_mut() {
+        // Build the Handle once at rasterization time so its internal id
+        // is stable across all subsequent `view()` calls for this page.
+        let handle = Handle::from_rgba(image.width, image.height, image.pixels);
         book.cached = Some(CachedPage {
             chapter_index,
             page_in_chapter: page_index,
-            width: image.width,
-            height: image.height,
-            pixels: bytes::Bytes::from(image.pixels),
+            handle,
         });
     }
 }
@@ -562,6 +578,10 @@ fn update_with_cache(app: &mut App, message: Message) -> Task<Message> {
 }
 
 /// Bench-only rasterization entry point. See [`crate::bench`].
+///
+/// Always rasterizes at scale 1.0 so existing benches/tests can assert on
+/// `viewport.width × viewport.height` pixel dimensions. Production code
+/// goes through [`ensure_cache`] which uses [`RENDER_SCALE`] for HiDPI.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn render_page_for_bench(
     page: &crate::layout::Page,
@@ -571,5 +591,13 @@ pub(crate) fn render_page_for_bench(
     font_system: &mut crate::layout::FontSystem,
     swash_cache: &mut cosmic_text::SwashCache,
 ) -> render::PageImage {
-    render::render_page(page, chapter, viewport, theme, font_system, swash_cache)
+    render::render_page(
+        page,
+        chapter,
+        viewport,
+        theme,
+        1.0,
+        font_system,
+        swash_cache,
+    )
 }
