@@ -22,6 +22,10 @@ const PLACEHOLDER_H: f32 = 100.0;
 /// enough to keep tightly packed image-heavy chapters legible.
 const IMAGE_MARGIN: f32 = 8.0;
 
+/// Oversample factor used when rasterizing SVGs. Matches the page render
+/// scale so SVG glyphs stay crisp on HiDPI without burning RAM.
+const SVG_RASTER_SCALE: f32 = 2.0;
+
 /// Top-level entry point. See [`super::paginate`] for the public docs.
 pub(crate) fn paginate(
     book: &mut dyn BookSource,
@@ -196,6 +200,11 @@ fn resolve_image(
         }
     };
 
+    if is_svg(src, &bytes) {
+        return decode_svg(src, &resolved, &bytes, inner_width, inner_height)
+            .unwrap_or_else(|| placeholder(src));
+    }
+
     let decoded = match image::load_from_memory(&bytes) {
         Ok(img) => img.to_rgba8(),
         Err(err) => {
@@ -228,6 +237,102 @@ fn resolve_image(
         margin_top: IMAGE_MARGIN,
         margin_bottom: IMAGE_MARGIN,
     }
+}
+
+/// True if `src` (extension) or `bytes` (XML/`<svg` magic) suggest the
+/// resource is SVG. We check both because some EPUBs ship `.xml`-extension
+/// SVGs or omit the extension entirely.
+fn is_svg(src: &str, bytes: &[u8]) -> bool {
+    let lower = src.to_ascii_lowercase();
+    if lower.ends_with(".svg") || lower.ends_with(".svgz") {
+        return true;
+    }
+    let head = bytes.get(..512.min(bytes.len())).unwrap_or(&[]);
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let trimmed = text.trim_start_matches('\u{FEFF}').trim_start();
+    if trimmed.starts_with("<svg") {
+        return true;
+    }
+    if trimmed.starts_with("<?xml") {
+        return trimmed.contains("<svg");
+    }
+    false
+}
+
+/// Rasterize an SVG resource to RGBA8 at `SVG_RASTER_SCALE * intrinsic`
+/// for HiDPI crispness. Returns `None` (logging once) on any failure so
+/// the caller falls back to the standard placeholder.
+fn decode_svg(
+    src: &str,
+    resolved: &str,
+    bytes: &[u8],
+    inner_width: f32,
+    inner_height: f32,
+) -> Option<ImageBuffer> {
+    let opts = resvg::usvg::Options::default();
+    let tree = match resvg::usvg::Tree::from_data(bytes, &opts) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(
+                src = %src,
+                resolved = %resolved,
+                error = %err,
+                "layout: failed to parse <svg>; using placeholder"
+            );
+            return None;
+        }
+    };
+
+    let size = tree.size();
+    let logical_w = size.width().max(1.0);
+    let logical_h = size.height().max(1.0);
+    let pixel_w = (logical_w * SVG_RASTER_SCALE).ceil().max(1.0) as u32;
+    let pixel_h = (logical_h * SVG_RASTER_SCALE).ceil().max(1.0) as u32;
+
+    let mut pixmap = match resvg::tiny_skia::Pixmap::new(pixel_w, pixel_h) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                src = %src,
+                resolved = %resolved,
+                w = pixel_w,
+                h = pixel_h,
+                "layout: failed to allocate SVG pixmap; using placeholder"
+            );
+            return None;
+        }
+    };
+
+    let transform = resvg::tiny_skia::Transform::from_scale(SVG_RASTER_SCALE, SVG_RASTER_SCALE);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // tiny-skia stores premultiplied RGBA; the rest of the pipeline
+    // (image::RgbaImage, blit_rgba_scaled) expects straight RGBA. Demultiply
+    // any partially-transparent pixel so anti-aliased edges don't darken.
+    let mut data = pixmap.take();
+    for chunk in data.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a > 0 && a < 255 {
+            let af = a as u32;
+            chunk[0] = ((chunk[0] as u32 * 255 + af / 2) / af).min(255) as u8;
+            chunk[1] = ((chunk[1] as u32 * 255 + af / 2) / af).min(255) as u8;
+            chunk[2] = ((chunk[2] as u32 * 255 + af / 2) / af).min(255) as u8;
+        }
+    }
+
+    let (display_w, display_h) = fit_to(logical_w, logical_h, inner_width, inner_height);
+    Some(ImageBuffer {
+        src: src.to_owned(),
+        rgba: Some(Arc::new(data)),
+        intrinsic_w: pixel_w,
+        intrinsic_h: pixel_h,
+        display_w,
+        display_h,
+        margin_top: IMAGE_MARGIN,
+        margin_bottom: IMAGE_MARGIN,
+    })
 }
 
 fn placeholder(src: &str) -> ImageBuffer {
@@ -517,5 +622,47 @@ mod tests {
             resolve_path("./foo.png", "OEBPS/text/ch1.xhtml"),
             "OEBPS/text/foo.png"
         );
+    }
+
+    #[test]
+    fn is_svg_extension() {
+        assert!(is_svg("foo.svg", b""));
+        assert!(is_svg("FOO.SVG", b""));
+        assert!(is_svg("path/to/foo.svgz", b""));
+        assert!(!is_svg("foo.png", b""));
+    }
+
+    #[test]
+    fn is_svg_magic() {
+        assert!(is_svg("nope", b"<svg xmlns=\"...\"></svg>"));
+        assert!(is_svg(
+            "nope",
+            b"<?xml version=\"1.0\"?>\n<svg xmlns=\"...\"></svg>"
+        ));
+        assert!(!is_svg("nope", b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_svg("nope", b"<?xml version=\"1.0\"?><html></html>"));
+    }
+
+    #[test]
+    fn decode_svg_produces_buffer() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20" viewBox="0 0 40 20"><rect width="40" height="20" fill="#f00"/></svg>"##;
+        let buf =
+            decode_svg("inline.svg", "inline.svg", svg, 800.0, 1200.0).expect("svg should decode");
+        // Rasterized at SVG_RASTER_SCALE (2x) of intrinsic 40x20.
+        assert_eq!(buf.intrinsic_w, 80);
+        assert_eq!(buf.intrinsic_h, 40);
+        // fit_to never upscales: display equals logical size.
+        assert!((buf.display_w - 40.0).abs() < 0.01);
+        assert!((buf.display_h - 20.0).abs() < 0.01);
+        let pixels = buf.rgba.expect("decoded svg should have pixels");
+        assert_eq!(pixels.len(), (80 * 40 * 4) as usize);
+        // Center pixel should be solid red.
+        let cx = 40usize;
+        let cy = 20usize;
+        let i = (cy * 80 + cx) * 4;
+        assert_eq!(pixels[i], 0xFF);
+        assert_eq!(pixels[i + 1], 0x00);
+        assert_eq!(pixels[i + 2], 0x00);
+        assert_eq!(pixels[i + 3], 0xFF);
     }
 }

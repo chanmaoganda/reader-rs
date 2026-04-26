@@ -187,7 +187,7 @@ fn walk_block_children(
                 } else if is_block_tag(&tag) {
                     flush_anon(&mut anon_runs, &anon_style, anon_indent, state);
                     handle_block(child, parent_style, state, anon_indent);
-                } else if matches!(tag.as_str(), "div") {
+                } else if is_transparent_block_tag(&tag) {
                     // Transparent passthrough.
                     flush_anon(&mut anon_runs, &anon_style, anon_indent, state);
                     walk_block_children(child, parent_style, state, list_depth);
@@ -290,7 +290,7 @@ fn emit_list_item(
                 }
                 if matches!(tag.as_str(), "ul" | "ol") {
                     nested_blocks.push(child);
-                } else if tag == "img" || is_block_tag(&tag) || tag == "div" {
+                } else if tag == "img" || is_block_tag(&tag) || is_transparent_block_tag(&tag) {
                     nested_blocks.push(child);
                     block_descent_needed = true;
                 } else if is_inline_tag(&tag) {
@@ -356,7 +356,7 @@ fn emit_list_item(
             state.blocks.push(Block::Image { src });
         } else if is_block_tag(&tag) {
             handle_block(nested, &style, state, item_indent);
-        } else if tag == "div" {
+        } else if is_transparent_block_tag(&tag) {
             walk_block_children(nested, &style, state, list_depth);
         }
     }
@@ -381,8 +381,9 @@ fn flush_anon(
     });
 }
 
-/// Handle one block-level element by computing its style and either
-/// recursing (for nested-block containers) or harvesting inline content.
+/// Handle one block-level element by computing its style, then walking
+/// its descendants so that nested `<img>` elements split the surrounding
+/// inline content into separate paragraphs and an [`Block::Image`] block.
 fn handle_block(
     node: Node<'_, '_>,
     parent_style: &ComputedStyle,
@@ -396,11 +397,10 @@ fn handle_block(
         cascade.apply_inline(inline);
     }
     let style = cascade.into_style();
-
-    // Headings, p, blockquote: harvest inline content directly.
-    let mut runs: Vec<InlineRun> = Vec::new();
     let run_style = style.run_style();
-    collect_inline_children(node, &run_style, &mut runs, state);
+
+    let mut runs: Vec<InlineRun> = Vec::new();
+    collect_block_inline_with_imgs(node, &run_style, &mut runs, &style, indent_left, state);
 
     if runs.iter().any(|r| !r.text.trim().is_empty()) {
         state.blocks.push(Block::Paragraph {
@@ -408,11 +408,81 @@ fn handle_block(
             runs,
             indent_left,
         });
-    } else if has_block_descendants(node) {
-        // Defensive: if the block actually contained a block-level child
+    } else if runs.is_empty() && has_block_descendants(node) {
+        // Defensive: if the block contained only a block-level child
         // (e.g. a `<blockquote>` inside a `<p>`, technically invalid HTML
-        // but possible), recurse so we don't drop the content.
+        // but possible) and no inline content, recurse so we don't drop it.
         walk_block_children(node, parent_style, state, 0);
+    }
+}
+
+/// Walk descendants of a paragraph-class block, accumulating inline
+/// content into `runs` while flushing on `<img>`: any pending text becomes
+/// a paragraph, then an [`Block::Image`] block is emitted, and collection
+/// continues into a fresh `runs` buffer.
+fn collect_block_inline_with_imgs(
+    node: Node<'_, '_>,
+    run_style: &RunStyle,
+    runs: &mut Vec<InlineRun>,
+    para_style: &ComputedStyle,
+    indent_left: f32,
+    state: &mut ParseState,
+) {
+    for child in node.children() {
+        match child.node_type() {
+            roxmltree::NodeType::Element => {
+                let tag = tag_lower(&child);
+                if matches!(tag.as_str(), "head" | "title" | "style" | "script") {
+                    continue;
+                }
+                if tag == "img" {
+                    if runs.iter().any(|r| !r.text.trim().is_empty()) {
+                        state.blocks.push(Block::Paragraph {
+                            style: para_style.clone(),
+                            runs: std::mem::take(runs),
+                            indent_left,
+                        });
+                    } else {
+                        runs.clear();
+                    }
+                    let src = child.attribute("src").unwrap_or("").to_owned();
+                    state.blocks.push(Block::Image { src });
+                } else if is_inline_tag(&tag) {
+                    if tag == "br" {
+                        runs.push(InlineRun {
+                            text: "\n".to_owned(),
+                            style: run_style.clone(),
+                        });
+                    } else {
+                        let next = inline_style_for(&tag, run_style);
+                        collect_block_inline_with_imgs(
+                            child,
+                            &next,
+                            runs,
+                            para_style,
+                            indent_left,
+                            state,
+                        );
+                    }
+                } else {
+                    warn_unknown(&tag, state);
+                    collect_block_inline_with_imgs(
+                        child,
+                        run_style,
+                        runs,
+                        para_style,
+                        indent_left,
+                        state,
+                    );
+                }
+            }
+            roxmltree::NodeType::Text => {
+                if let Some(text) = child.text() {
+                    push_text(runs, text, run_style.clone());
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -535,8 +605,56 @@ pub(crate) fn is_block_tag(tag: &str) -> bool {
     )
 }
 
+/// Block-level containers we treat as transparent passthroughs: their
+/// children are walked as if the wrapper weren't there. Useful for HTML5
+/// sectioning elements that EPUBs sprinkle around for semantics.
+pub(crate) fn is_transparent_block_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "div"
+            | "section"
+            | "article"
+            | "aside"
+            | "header"
+            | "footer"
+            | "main"
+            | "nav"
+            | "figure"
+            | "figcaption"
+    )
+}
+
 pub(crate) fn is_inline_tag(tag: &str) -> bool {
-    matches!(tag, "em" | "i" | "strong" | "b" | "span" | "br")
+    matches!(
+        tag,
+        "em" | "i"
+            | "strong"
+            | "b"
+            | "span"
+            | "br"
+            | "a"
+            | "sup"
+            | "sub"
+            | "small"
+            | "s"
+            | "u"
+            | "cite"
+            | "code"
+            | "kbd"
+            | "var"
+            | "samp"
+            | "mark"
+            | "q"
+            | "abbr"
+            | "time"
+            | "dfn"
+            | "ruby"
+            | "rt"
+            | "rp"
+            | "wbr"
+            | "bdi"
+            | "bdo"
+    )
 }
 
 #[cfg(test)]
@@ -600,6 +718,62 @@ mod tests {
             (indents[1] - indents[0] - INDENT_PER_LEVEL).abs() < 0.01,
             "expected delta of one INDENT_PER_LEVEL; got {indents:?}"
         );
+    }
+
+    #[test]
+    fn img_inside_paragraph_splits_into_para_image_para() {
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>before<img src="foo.png"/>after</p></body></html>"#,
+        );
+        let kinds: Vec<&str> = parsed
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph { .. } => "p",
+                Block::Image { .. } => "img",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["p", "img", "p"]);
+        let texts: Vec<String> = parsed.blocks.iter().filter_map(paragraph_text).collect();
+        assert_eq!(texts, vec!["before".to_owned(), "after".to_owned()]);
+    }
+
+    #[test]
+    fn img_inside_nested_inline_still_splits() {
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>x<span><img src="y.png"/></span>z</p></body></html>"#,
+        );
+        let kinds: Vec<&str> = parsed
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph { .. } => "p",
+                Block::Image { .. } => "img",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["p", "img", "p"]);
+    }
+
+    #[test]
+    fn aside_is_transparent_passthrough() {
+        let parsed = parse(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><aside><p>note</p></aside></body></html>"#,
+        );
+        let texts: Vec<String> = parsed.blocks.iter().filter_map(paragraph_text).collect();
+        assert_eq!(texts, vec!["note".to_owned()]);
+    }
+
+    #[test]
+    fn anchor_inline_tag_does_not_warn_or_drop_text() {
+        let parsed = parse(
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>see <a href="#x">here</a>.</p></body></html>"##,
+        );
+        let texts: Vec<String> = parsed.blocks.iter().filter_map(paragraph_text).collect();
+        assert_eq!(texts, vec!["see here.".to_owned()]);
     }
 
     #[test]
