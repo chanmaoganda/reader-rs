@@ -100,3 +100,54 @@ Both worth remembering for PR5+: when integrating new methods from cosmic-text/i
 - The PRD's "Implementation Plan (small PRs)" lists PR1–PR6; PR3.5 was added mid-session as a deliberate split. PR1, PR2, PR3, PR4, PR3.5 are all done. PR5, PR4.5, PR6 remain.
 - Use `cargo run --release -- "/home/ethan/Documents/china-in-map/《地图中的中国通史》[上下册].epub"` to dogfood; that's the de-facto acceptance test.
 - The user prefers: dark theme (locked), single-question brainstorm flow (recorded), commit-as-you-go (every PR), independent check-agent review after each implement.
+
+
+## Session 1: feat(ui): two-page spread view (facing pages)
+
+**Date**: 2026-04-26
+**Task**: feat(ui): two-page spread view (facing pages)
+**Branch**: `master`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Description |
+|------|-------------|
+| State | `App.spread_mode: bool` (default false) + session-scoped (not persisted, matches theme/font). |
+| Predicates | `App::effective_per_page_viewport` and `spread_active()` — both paginate and render branch on `spread_active()` so auto-fallback can never desync the two paths. |
+| Pagination | Per-slot width = `(viewport - TOC? - GUTTER) / 2`, `GUTTER = 24.0`. Falls back to single-page when slot < `MIN_VIEWPORT_DIM`. |
+| Rasterization | `CachedPage` extended with `right_handle + spread`; right slot only rendered when chapter has page at `idx+1`. Odd final page → blank right slot, never spills into next chapter. |
+| Navigation | Next/Prev step by 2 in spread mode; cursor invariant: always points at LEFT page (even index). Snap-on-enter masks low bit; snap-after-repaginate rounds restored fractional cursor down to even. End-key (LastPage) and prev-into-prior-chapter both even-align. |
+| Persistence | `current_page_in_chapter` stays in single-page units across mode toggles — switching modes mid-book never loses position. |
+| Logging | One `tracing::debug!` per fallback transition via `App.spread_fallback_active` (not per frame). |
+| UI | Hotkey `S`; toolbar button `▥ Spread` ↔ `▤ Single` showing target state. |
+
+**Updated Files**:
+- `src/ui/mod.rs` (+236 lines net of churn — state, predicates, message, snap logic, drain_worker integration)
+- `src/ui/reader.rs` (+54 — toolbar button, two-image row layout)
+
+**Verification**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` all green. `page_turn` bench unaffected (same per-page texture rendered twice).
+
+**Out of scope (deferred)**: persisting spread mode per-book, RTL reading order, 3+ page layouts, "first page right" cover convention, image-affinity smart pagination.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `722a92c` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
