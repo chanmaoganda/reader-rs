@@ -5,7 +5,7 @@
 //! rasterization; this module just stages the [`Handle`] and arranges the
 //! widget tree.
 
-use iced::widget::image::Handle;
+use iced::widget::image::{FilterMethod, Handle};
 use iced::widget::{Column, Row, Space, button, column, container, image, row, scrollable, text};
 use iced::{Center, Element, Fill, Length};
 
@@ -56,9 +56,16 @@ pub(crate) fn view<'a>(
 }
 
 /// Reader-pane content for a successfully-rasterized page.
+///
+/// `FilterMethod::Nearest` is intentional: with the chrome-aware viewport
+/// (`super::App::effective_viewport`), the rasterized texture's physical
+/// pixel dimensions match the displayed pane area to within a sub-pixel,
+/// so any resampling the GPU does is at most one row/column off — Nearest
+/// keeps the glyph edges crisp where the default `Linear` would soften.
 pub(crate) fn pane_image(handle: Handle) -> Element<'static, Message> {
     image(handle)
         .content_fit(iced::ContentFit::Contain)
+        .filter_method(FilterMethod::Nearest)
         .width(Fill)
         .height(Fill)
         .into()
@@ -78,12 +85,14 @@ pub(crate) fn pane_spread(
 ) -> Element<'static, Message> {
     let left_el: Element<'static, Message> = image(left)
         .content_fit(iced::ContentFit::Contain)
+        .filter_method(FilterMethod::Nearest)
         .width(Fill)
         .height(Fill)
         .into();
     let right_el: Element<'static, Message> = match right {
         Some(handle) => image(handle)
             .content_fit(iced::ContentFit::Contain)
+            .filter_method(FilterMethod::Nearest)
             .width(Fill)
             .height(Fill)
             .into(),

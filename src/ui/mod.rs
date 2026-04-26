@@ -95,6 +95,21 @@ const FONT_SIZE_STEP: f32 = 1.0;
 /// cursor's fractional position.
 const TOC_WIDTH: f32 = 280.0;
 
+/// Logical-pixel height the toolbar steals from the reader pane. Empirical
+/// from `ui::reader::toolbar` — `padding([4, 12])` plus size-13 buttons
+/// padded `[4, 10]`. The viewport handed to the paginator/rasterizer
+/// subtracts this so the rasterized texture matches the displayed pane
+/// area; otherwise iced applies `ContentFit::Contain` with the default
+/// linear filter and softens text. Update in lockstep with the toolbar.
+const TOOLBAR_HEIGHT: f32 = 32.0;
+
+/// Logical-pixel height the status bar steals when it is shown
+/// (`App::status.is_some()`). Empirical from `ui::reader::view` —
+/// `container(text(msg).size(12)).padding(4)`. Like [`TOOLBAR_HEIGHT`],
+/// subtracted from [`App::effective_viewport`] so texture height matches
+/// the display slot.
+const STATUS_BAR_HEIGHT: f32 = 20.0;
+
 /// Logical-pixel gap between the two facing pages in spread mode. Slim
 /// enough to avoid wasting reading area, wide enough to read as a clear
 /// page break. Subtracted from the available width before halving in
@@ -170,6 +185,12 @@ struct App {
     /// `scale_factor` (or fires `Event::Window(Rescaled)`). Always clamped
     /// to `[MIN_RENDER_SCALE, MAX_RENDER_SCALE]`.
     render_scale: f32,
+    /// `false` until iced has reported a `scale_factor` for the first time.
+    /// Used to emit a one-shot `INFO` log of the raw value so HiDPI bugs
+    /// (compositor reporting 1.0 on a Retina display, etc.) are observable
+    /// even when the reported value happens to match [`DEFAULT_RENDER_SCALE`]
+    /// and the existing change-only `info!` would stay silent.
+    initial_scale_logged: bool,
     /// Latest resize event we have NOT yet acted on, plus the deadline at
     /// which we will. The poll subscription checks this every
     /// [`POLL_INTERVAL`] and commits once `Instant::now() >= deadline`.
@@ -218,6 +239,7 @@ impl App {
             recents,
             viewport: DEFAULT_VIEWPORT,
             render_scale: DEFAULT_RENDER_SCALE,
+            initial_scale_logged: false,
             pending_resize: None,
             repaginating: false,
             toc_open: false,
@@ -228,18 +250,31 @@ impl App {
 
     /// Logical viewport actually available to the reader pane (the area
     /// containing both spread slots, if spread mode is active). Subtracts
-    /// the TOC sidebar width when [`App::toc_open`] is true; clamped to a
-    /// floor of [`MIN_VIEWPORT_DIM`] so opening the TOC on a narrow window
-    /// can never produce a non-positive paginate width.
+    /// the TOC sidebar width when [`App::toc_open`] is true and the
+    /// toolbar/status-bar heights consumed by [`ui::reader::view`];
+    /// clamped to a floor of [`MIN_VIEWPORT_DIM`] so a narrow / squat
+    /// window can never produce a non-positive paginate dimension.
     fn effective_viewport(&self) -> Viewport {
-        if self.toc_open {
-            Viewport {
-                width: (self.viewport.width - TOC_WIDTH).max(MIN_VIEWPORT_DIM),
-                height: self.viewport.height,
-            }
+        let width = if self.toc_open {
+            (self.viewport.width - TOC_WIDTH).max(MIN_VIEWPORT_DIM)
         } else {
-            self.viewport
+            self.viewport.width
+        };
+        let height = (self.viewport.height - self.chrome_height()).max(MIN_VIEWPORT_DIM);
+        Viewport { width, height }
+    }
+
+    /// Total logical-pixel height consumed by chrome (toolbar plus the
+    /// status bar when present). Used by [`App::effective_viewport`] so
+    /// the rasterized texture's physical pixel dimensions match the
+    /// display slot — otherwise iced has to downscale the texture and the
+    /// default `FilterMethod::Linear` softens text.
+    fn chrome_height(&self) -> f32 {
+        let mut h = TOOLBAR_HEIGHT;
+        if self.status.is_some() {
+            h += STATUS_BAR_HEIGHT;
         }
+        h
     }
 
     /// Logical viewport handed to the paginator for a single page slot.
@@ -608,6 +643,11 @@ fn handle_open(app: &mut App, path: PathBuf) {
         pending_position_fraction: None,
         chapter_titles,
     };
+    // Set status BEFORE capturing the effective viewport: the status bar
+    // shrinks the reader pane (`App::chrome_height`) and we want the very
+    // first paginate request to use the post-chrome viewport so the
+    // resulting texture matches the display slot.
+    app.status = Some(format!("opened: {}", path.display()));
     let viewport = app.effective_per_page_viewport();
     // Always request chapter 0 for the empty-chapter scan; if the user
     // resumed past it, also request the resume chapter so the reader
@@ -617,7 +657,6 @@ fn handle_open(app: &mut App, path: PathBuf) {
         request_chapter(&mut open, start_chapter, viewport, &app.theme);
     }
     app.book = Some(open);
-    app.status = Some(format!("opened: {}", path.display()));
 }
 
 /// Push the current cursor into the recents store. Best-effort: a write
@@ -863,6 +902,17 @@ fn handle_rescaled(app: &mut App, factor: f32) {
     if !factor.is_finite() || factor <= 0.0 {
         tracing::warn!(factor, "ignoring non-positive scale_factor");
         return;
+    }
+    if !app.initial_scale_logged {
+        // One-shot diagnostic so we can confirm what iced actually reports
+        // on the user's display — the existing change-detecting `info!` below
+        // stays silent when the reported value matches DEFAULT_RENDER_SCALE.
+        tracing::info!(
+            raw = factor,
+            default = DEFAULT_RENDER_SCALE,
+            "first scale_factor reported by iced"
+        );
+        app.initial_scale_logged = true;
     }
     let clamped = factor.clamp(MIN_RENDER_SCALE, MAX_RENDER_SCALE);
     if (clamped - factor).abs() > f32::EPSILON {
