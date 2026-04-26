@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
+- **Total Sessions**: 2
 - **Last Active**: 2026-04-26
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~153 | Active |
+| `journal-1.md` | ~214 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-04-26 | ereader-brainstorm close-out: PR4.5 → PR6c (v1 reader complete) | `5adf70d`, `106521a`, `abcbc2e`, `474f7d1`, `11d9718`, `ccffe51` | `master` |
 | 1 | 2026-04-26 | feat(ui): two-page spread view (facing pages) | `722a92c` | `master` |
 <!-- @@@/auto:session-history -->
 

@@ -151,3 +151,64 @@ Both worth remembering for PR5+: when integrating new methods from cosmic-text/i
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: ereader-brainstorm close-out: PR4.5 → PR6c (v1 reader complete)
+
+**Date**: 2026-04-26
+**Task**: ereader-brainstorm close-out: PR4.5 → PR6c (v1 reader complete)
+**Branch**: `master`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+Closes the umbrella brainstorm task `04-25-ereader-brainstorm`. The original "Remaining work" table (PR4.5, PR5, PR6) is now fully shipped, plus one unplanned PR (`5adf70d`) for layout edge-cases the canonical CJK EPUB exposed once persistence let us reopen mid-book.
+
+| Commit | PR | Description |
+|--------|----|----|
+| `5adf70d` | (unplanned) | SVG images, inline `<img>` splits, HTML5 sectioning (`<section>`/`<article>`/`<nav>`/`<aside>`/`<header>`/`<footer>` as block). Surfaced once recents reopened the canonical book mid-chapter and we hit content the paragraph subset was silently dropping. |
+| `106521a` | PR5 | Recents + per-book reading position. JSON store at `dirs::data_dir()/reader-rs/recents.json` (schema v1, atomic write via `*.tmp` + fsync + rename). Cover thumbnails decoded once into RGBA8 sidecars under `covers/`. Book key = EPUB unique-id with absolute-path fallback. 20-entry cap, oldest-by-`last_read_at` evicted, sidecars cleaned best-effort. New `Error::Persistence { path, source: PersistenceErrorKind }` (Io / Json) — never leaks `serde_json::Error`. UTC `SystemTime` as Unix epoch u64; no `chrono`. RecentsStore lives on the iced UI thread (no Arc/Mutex). |
+| `abcbc2e` | PR4.5 | Live viewport + HiDPI `scale_factor` detection, debounced resize. Replaces the `DEFAULT_VIEWPORT 800×1200` and `RENDER_SCALE 2.0` constants with iced window subscriptions; resize triggers `repaginate_all_with_snapback` (the cursor-fraction restoration helper that PR6c/spread-view both reuse). |
+| `474f7d1` | PR6a | `rfd` file picker, error-clear-on-success, README with `cargo install --path .` instructions. |
+| `11d9718` | PR6b | Theme toggle + font-size scaling (`+`/`=`/`-`/`_`/`0` hotkeys + toolbar buttons). Both wire through `repaginate_all_with_snapback`. |
+| `ccffe51` | PR6c | TOC sidebar with chapter jump (hotkey `O`). Introduces `App::effective_viewport()` — the canonical "logical viewport for paginate" predicate, subtracting `TOC_WIDTH` when sidebar is open. Spread-view (Session 1) reused this exact pattern. |
+
+**Status against original Acceptance Criteria** (all 7):
+- [x] Open canonical 105 MB CJK EPUB → first paint ≤500 ms (~10 ms measured).
+- [x] Page-turn p99 ≤16.6 ms (~155 µs warm rasterize).
+- [x] Paginate ≤200 ms p95 (17 µs paragraph / 173 ms slowest image-heavy).
+- [x] CJK no-tofu across 62 chapters.
+- [x] Reading position survives close+reopen (PR5).
+- [ ] Side-by-side blind A/B vs current reader — not yet performed; subjective gate, can run anytime now.
+- [x] `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets` green.
+
+**Architectural through-line that emerged**: every chrome control (resize, theme, font, TOC, spread) flows through one cursor-preserving repagination path — `repaginate_all_with_snapback` captures the position fraction in single-page units before re-paginating, then restores it after. New controls just adjust `effective_viewport()` and call the helper. Worth noting because it's why the spread-view PR was so small.
+
+**Next session candidates (not committed to)**: A/B fluency test against Foliate/Calibre on canonical EPUB; image lazy-loading / cross-chapter LRU once a larger book exhausts memory; persisting spread mode per-book; click-through `<a href>` links (v2 territory).
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5adf70d` | (see git log) |
+| `106521a` | (see git log) |
+| `abcbc2e` | (see git log) |
+| `474f7d1` | (see git log) |
+| `11d9718` | (see git log) |
+| `ccffe51` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
