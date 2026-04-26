@@ -15,8 +15,8 @@
 pub mod error;
 pub mod format;
 pub mod layout;
+pub mod persistence;
 
-mod persistence;
 mod ui;
 
 #[cfg(any(test, feature = "test-support"))]

@@ -85,6 +85,39 @@ pub enum Error {
     /// or its outbound channel was closed unexpectedly.
     #[error("background worker failed: {0}")]
     Worker(String),
+
+    /// A persistence (recents / progress / cover) operation failed.
+    ///
+    /// Carries the offending `path` (per `error-handling.md`: errors must
+    /// identify the offending input) plus a typed [`PersistenceErrorKind`].
+    /// The underlying `serde_json` / `io` errors are kept off the public
+    /// surface (see `database-guidelines.md`: never leak `serde_json::Error`
+    /// through the library API — match on `PersistenceErrorKind` instead).
+    #[error("persistence operation failed at {path}")]
+    Persistence {
+        /// Filesystem path the operation targeted.
+        path: PathBuf,
+        /// Specific kind of persistence failure.
+        #[source]
+        source: PersistenceErrorKind,
+    },
+}
+
+/// Discriminates the underlying cause of a [`Error::Persistence`] failure.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PersistenceErrorKind {
+    /// An I/O syscall failed (open / read / write / rename / fsync).
+    #[error("I/O error")]
+    Io(#[source] std::io::Error),
+
+    /// The on-disk JSON could not be parsed or serialised.
+    #[error("JSON (de)serialisation error")]
+    Json(#[source] serde_json::Error),
+
+    /// A cover image could not be decoded or resized.
+    #[error("image decode/resize error: {0}")]
+    Image(String),
 }
 
 /// Convenience alias for `Result<T, Error>`.

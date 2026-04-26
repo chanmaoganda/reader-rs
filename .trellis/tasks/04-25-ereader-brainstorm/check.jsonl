@@ -5,3 +5,4 @@
 {"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Verify tracing usage; no println for diagnostics"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Run clippy/fmt/test gate"}
 {"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Same"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Verify persistence layer matches storage rules"}

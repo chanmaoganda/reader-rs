@@ -10,6 +10,7 @@
 //! crate.
 
 mod reader;
+mod recents;
 mod render;
 mod worker;
 
@@ -24,6 +25,7 @@ use iced::{Subscription, Task, Theme as IcedTheme, event, keyboard};
 use crate::error::{Error, Result};
 use crate::format::{BookSource, EpubSource};
 use crate::layout::{LaidOutChapter, Theme as LayoutTheme, Viewport};
+use crate::persistence::RecentsStore;
 
 use self::render::PageImage;
 use self::worker::{WorkerHandle, WorkerRequest, WorkerResponse};
@@ -61,6 +63,9 @@ struct OpenBook {
     /// Cached rasterized image for the current page so view() doesn't
     /// re-rasterize on every redraw.
     cached: Option<CachedPage>,
+    /// Stable identifier under which this book is tracked in the
+    /// [`RecentsStore`]. Set at open time; used to push progress updates.
+    persistence_key: String,
 }
 
 struct CachedPage {
@@ -81,10 +86,17 @@ struct App {
     font_system: FontSystem,
     swash_cache: SwashCache,
     theme: LayoutTheme,
+    /// Recents + reading-position store. Owned by the UI thread; no
+    /// concurrency needed (single writer, see PR5 sub-decisions).
+    recents: RecentsStore,
 }
 
 impl App {
     fn new() -> Self {
+        let recents = RecentsStore::load_default().unwrap_or_else(|err| {
+            tracing::warn!(?err, "recents store init failed; persistence disabled");
+            RecentsStore::empty()
+        });
         Self {
             book: None,
             error: None,
@@ -92,6 +104,7 @@ impl App {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
             theme: LayoutTheme::dark(),
+            recents,
         }
     }
 }
@@ -100,6 +113,9 @@ impl App {
 pub(crate) enum Message {
     /// Open the file at `path` (sent on boot if argv supplied one).
     OpenPath(PathBuf),
+    /// Open the file at `path`, selected from the recents start screen.
+    /// Routes through the same code path as [`Message::OpenPath`].
+    OpenFromRecents(PathBuf),
     /// User pressed a navigation key.
     Nav(NavCommand),
     /// Tick from the response-poll subscription. Drains the worker channel.
@@ -129,7 +145,7 @@ fn boot(initial_path: Option<PathBuf>) -> (App, Task<Message>) {
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::OpenPath(path) => {
+        Message::OpenPath(path) | Message::OpenFromRecents(path) => {
             handle_open(app, path);
             Task::none()
         }
@@ -146,7 +162,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn handle_open(app: &mut App, path: PathBuf) {
-    let book = match EpubSource::open(&path) {
+    let mut book = match EpubSource::open(&path) {
         Ok(b) => b,
         Err(err) => {
             tracing::error!(?err, ?path, "failed to open book");
@@ -161,6 +177,21 @@ fn handle_open(app: &mut App, path: PathBuf) {
     }
     tracing::info!(path = %path.display(), chapters = spine_len, "opened book");
 
+    // Compute persistence key and seed cursor from any saved progress
+    // BEFORE we hand `book` to the worker (which takes ownership).
+    let persistence_key = RecentsStore::book_key(&book, &path);
+    let saved_cursor = app
+        .recents
+        .get(&persistence_key)
+        .map(|e| (e.current_chapter, e.current_page_in_chapter))
+        .filter(|(ch, _)| *ch < spine_len);
+
+    // Record the open + persist (atomic). Best-effort: a write failure
+    // logs but doesn't block the user from reading.
+    if let Err(err) = app.recents.record_open(&mut book, &path) {
+        tracing::warn!(?err, "recents.record_open failed");
+    }
+
     let worker = match worker::spawn(Box::new(book)) {
         Ok(w) => w,
         Err(err) => {
@@ -170,17 +201,72 @@ fn handle_open(app: &mut App, path: PathBuf) {
         }
     };
     let chapters = (0..spine_len).map(|_| ChapterState::NotRequested).collect();
+    let (start_chapter, start_page) = saved_cursor.unwrap_or((0, 0));
     let mut open = OpenBook {
         chapters,
-        current_chapter: 0,
-        current_page_in_chapter: 0,
+        current_chapter: start_chapter,
+        current_page_in_chapter: start_page,
         viewport: DEFAULT_VIEWPORT,
         worker,
         cached: None,
+        persistence_key,
     };
+    // Always request chapter 0 for the empty-chapter scan; if the user
+    // resumed past it, also request the resume chapter so the reader
+    // doesn't sit on "paginating…" any longer than necessary.
     request_chapter(&mut open, 0, &app.theme);
+    if start_chapter != 0 {
+        request_chapter(&mut open, start_chapter, &app.theme);
+    }
     app.book = Some(open);
     app.status = Some(format!("opened: {}", path.display()));
+}
+
+/// Push the current cursor into the recents store. Best-effort: a write
+/// failure logs but does not affect the read flow.
+fn persist_progress(app: &mut App) {
+    let Some(book) = app.book.as_ref() else {
+        return;
+    };
+    let key = book.persistence_key.clone();
+    let chapter = book.current_chapter;
+    let page = book.current_page_in_chapter;
+    let (global, total) = global_page_progress(book);
+    if let Err(err) = app
+        .recents
+        .update_progress(&key, chapter, page, global, total)
+    {
+        tracing::warn!(?err, %key, "persist progress failed");
+    }
+}
+
+/// Compute the (global_page, total_pages) pair across the whole spine, if
+/// every chapter the cursor has crossed has been paginated. Returns
+/// `(None, None)` when we don't yet know — better to leave the saved
+/// progress alone than to overwrite it with a partial number.
+fn global_page_progress(book: &OpenBook) -> (Option<usize>, Option<usize>) {
+    let mut total = 0usize;
+    let mut all_known = true;
+    for state in &book.chapters {
+        match state {
+            ChapterState::Loaded(c) => total += c.page_count(),
+            _ => {
+                all_known = false;
+                break;
+            }
+        }
+    }
+    if !all_known {
+        return (None, None);
+    }
+    let mut global = 0usize;
+    for state in book.chapters.iter().take(book.current_chapter) {
+        if let ChapterState::Loaded(c) = state {
+            global += c.page_count();
+        }
+    }
+    global += book.current_page_in_chapter;
+    (Some(global), Some(total))
 }
 
 fn request_chapter(book: &mut OpenBook, chapter_index: usize, theme: &LayoutTheme) {
@@ -278,6 +364,7 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
     let Some(book) = app.book.as_mut() else {
         return;
     };
+    let before = (book.current_chapter, book.current_page_in_chapter);
     match cmd {
         NavCommand::NextPage => nav_next_page(book, &theme),
         NavCommand::PrevPage => nav_prev_page(book, &theme),
@@ -309,6 +396,10 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
                 book.cached = None;
             }
         }
+    }
+    let after = (book.current_chapter, book.current_page_in_chapter);
+    if after != before {
+        persist_progress(app);
     }
 }
 
@@ -383,6 +474,9 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         return reader::empty_view(err);
     }
     let Some(book) = app.book.as_ref() else {
+        if !app.recents.is_empty() {
+            return recents::view(&app.recents);
+        }
         return reader::empty_view("drop a file or pass one as argv");
     };
 

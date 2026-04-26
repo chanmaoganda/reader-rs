@@ -5,3 +5,4 @@
 {"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "tracing init in main is part of PR1"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Forbidden patterns + clippy gate apply on every PR"}
 {"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Layout has multiple parsers/cascades; reuse-thinking matters"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "PR5 introduces JSON storage; persistence rules (UTC, atomic write, error mapping) live here even though it's not SQLite"}

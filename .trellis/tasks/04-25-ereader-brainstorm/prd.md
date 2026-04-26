@@ -277,6 +277,22 @@ Plus pre-session: `09e1856 chore: bootstrap project (Trellis scaffold, configs, 
 
 Implementation plan in the `## Decision (ADR-lite)` and `## Technical Approach` sections still applies — those describe the design as planned; the deltas above record what actually changed during execution.
 
+### PR5 sub-decisions (locked 2026-04-26)
+
+Locked before implement-agent dispatch so the agent doesn't drift:
+
+* **Book key**: prefer `BookSource::metadata().identifier` (EPUB unique-id, present on essentially every EPUB3); fall back to the canonical absolute path when the identifier is missing or empty. No content hash in v1 — promote later if the user reports duplicate-key collisions.
+* **Cover thumbnail**: at `record_open` time, decode `BookSource::cover()` once via the `image` crate, resize to fit a 256×256 box (preserve aspect ratio), and store as raw RGBA8 at `data_dir/reader-rs/covers/<sanitised-key>.bin` next to a sidecar `<sanitised-key>.json` carrying `width`/`height`. The recents view does a cheap `mmap`-style read + `iced::widget::image::Handle::from_rgba`. Re-decode on every render was rejected as wasteful for the 20-book grid.
+* **Atomic write**: every save writes to `recents.json.tmp`, `fsync`s, then `fs::rename`s into place. Same for cover sidecars. Survives crash/power-loss without a half-written JSON.
+* **Schema versioning**: file format is `{ "version": 1, "entries": [RecentEntry, ...] }`. Unknown version → `tracing::warn!` and start with an empty store (don't crash, don't silently overwrite — the user can downgrade if they need to).
+* **Save cadence**: write on `record_open` and after every successful page-turn (next/prev/jump). The JSON is a few KB; no debounce in v1. Revisit if profiling shows IO contention.
+* **File picker (`rfd`)**: out of scope for PR5. Keeps PR5 small. PR5 ships argv-only first-time entry; once a book has been opened once, the recents grid handles every subsequent open. PR6 adds the `rfd` "Open file…" button alongside TOC/font-scale/theme.
+* **Concurrency**: `RecentsStore` lives on the iced UI thread only. No `Arc<Mutex<…>>`. The app owns it by value.
+* **Error mapping**: new `Error::Persistence { path, source: PersistenceErrorKind }` variant in `src/error.rs`, where `PersistenceErrorKind` distinguishes `Io(io::Error)` from `Json(serde_json::Error)`. Per `database-guidelines.md`, never leak `serde_json::Error` through the public API.
+* **UTC timestamps**: `last_read_at` is `std::time::SystemTime` serialised as Unix epoch seconds (u64) — UTC at rest per `database-guidelines.md`, no `chrono`/`time` dep needed.
+* **Recents cap**: 20 entries. On overflow, drop the oldest by `last_read_at`. Removed entries' cover sidecars are deleted (best-effort, log on failure).
+* **Module placement**: replace the existing 4-line `src/persistence.rs` stub with the real implementation (single file per `directory-structure.md`'s "files over directories" rule). New start-screen UI lives at `src/ui/recents.rs`.
+
 ### Notes for the next session
 
 * Active task `04-25-ereader-brainstorm` was paused at end of PR3.5 (current task pointer cleared via `python3 ./.trellis/scripts/task.py finish` if needed; otherwise `start` it again).
