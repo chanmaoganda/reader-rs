@@ -1,5 +1,7 @@
 # brainstorm: build a fluent e-reader in Rust
 
+> **Status (2026-04-25, end of day 1)**: PR1 → PR4 + PR3.5 are committed. Reader is functional end-to-end on the canonical 105 MB CJK EPUB: paragraphs, headings, lists, images, dark theme, HiDPI-crisp, fluent page-turns. **Remaining: PR5 (recents + persistence), PR4.5 (window resize / scale_factor detection), PR6 (TOC nav, font-scale UI, theme toggle, error UI, README).** See `## Progress (chronological)` below for the actual landing order; the original `## Technical Approach` section is the design as planned, kept for reference.
+
 ## Goal
 
 Design and (eventually) build `reader-rs`: a desktop/mobile e-reader for ebook formats whose page-turn, scroll, and search feels noticeably more **fluent** than the user's current reader(s). Fluency is the explicit differentiator — not feature breadth.
@@ -212,3 +214,78 @@ The 105 MB canonical file likely contains many embedded images (this is what mak
 * Stream chapter XHTML on demand (don't decompress all chapters at open).
 * Lazy-decode images (`image` crate, decode only when on-screen or in the next-chapter prefetch window).
 * Cap the in-memory `LaidOutChapter` cache (LRU, target ≤200 MB resident for the open book).
+
+---
+
+## Progress (chronological)
+
+Updated 2026-04-25.
+
+### Done — 9 commits beyond trellis bootstrap
+
+| Commit | PR | Summary |
+|---|---|---|
+| `9d0594e` | PR1 | scaffold reader-rs (iced + bench harness) |
+| `3a1f452` | PR2 | EPUB loader behind BookSource trait |
+| `db2f04b` | PR3 | paragraph-subset layout engine on cosmic-text |
+| `1269f6f` | PR4 | reader view, page-turn budget met, dark theme default |
+| `9360d12` | PR4 fix | unstick empty chapters, stop flicker, rasterize at 2× for HiDPI |
+| `44f2786` | PR4 fix | pre-scale offset in HiDPI rasterization (compaction bug) |
+| `5c3a5e3` | PR3.5 | add list (ul/ol/li) and image (`<img>`) rendering |
+
+Plus pre-session: `09e1856 chore: bootstrap project (Trellis scaffold, configs, spec docs)` and `ca22e1c chore(task): archive 00-bootstrap-guidelines`.
+
+### Deltas from the original plan
+
+* **PR3 was tightened** to paragraph-subset only; lists + images split out into PR3.5. Both are now in.
+* **`paginate()` signature** ended up `(book: &mut dyn BookSource, chapter: &ChapterContent, viewport, theme, font_system) -> Result<LaidOutChapter>` — `&mut` because BookSource methods take `&mut self` and image resolution lives inside paginate.
+* **CSS parser is hand-rolled** (~50 LoC), not `cssparser`. Subset is small enough that cssparser was overkill; documented in `src/layout/style.rs`.
+* **`ImageBuffer::rgba` is `Option<Arc<Vec<u8>>>`** (not lazy/LRU). Decoded at paginate-time, lives with the chapter, Arc-shared. Works fine for the canonical 105 MB book (134 images decode cleanly with 0 placeholders); revisit if a much larger book exhausts memory.
+* **Dark theme is the default** (per user preference, mid-session). `Theme::default() == Theme::dark()`. Light palette defined; toggle UI is PR6.
+* **Two non-trivial bugs found post-implement**, both from third-party API quirks not visible in docs:
+  1. `roxmltree` rejects `<!DOCTYPE>` by default → every EPUB chapter failed silently. Fixed in PR3 with `ParsingOptions { allow_dtd: true, .. }`.
+  2. `cosmic_text 0.19::LayoutGlyph::physical(offset, scale)` adds `offset` unscaled while scaling glyph coords + font size → 2× glyphs at 1× margins on HiDPI = "compacted" rendering. Fixed in `44f2786` by pre-multiplying offset by scale.
+
+### Performance — measured against canonical 105 MB CJK EPUB
+
+| Metric | Budget | Measured (release, dev box) |
+|---|---|---|
+| Cold open of canonical EPUB to first paint | ≤500 ms | ~10 ms (chapter 1 paginate + rasterize) |
+| Paginate one chapter (off-UI worker) | ≤200 ms p95 | 17 µs paragraph-only / 173 ms slowest image-heavy |
+| Page-turn (cached pagination) | ≤16.6 ms p99 | ~155 µs warm rasterize |
+| All 134 canonical EPUB images decode | yes | 134/134, no placeholders |
+| CJK no-tofu | yes | confirmed across 62 chapters |
+| `cargo fmt && clippy -D warnings && cargo test --all-targets` | green | green |
+
+### Deferred / not in scope
+
+* `<table>`, `<svg>`, WebP/TIFF/BMP — canonical book never asks; if a future book does, expand `image` features and add tag handlers.
+* Hanging-indent typography for lists — markers render as ordinary inline runs.
+* Image lazy-loading / cross-chapter caching — Arc<Vec<u8>> already keeps per-chapter sharing cheap; no LRU yet.
+* `<a href>` / clickable regions — v2.
+* Annotations, highlights, notes, sync, accounts, DRM, audiobook/TTS — out per `## Out of Scope` above.
+
+---
+
+## Remaining work
+
+| PR | Title | Why | Est size |
+|---|---|---|---|
+| **PR5** | recents + persistence | Promotes the reader from "demo I open from CLI" to "tool I use". JSON store at `dirs::data_dir()/reader-rs/recents.json`; per-book reading position; recents start screen. | medium |
+| **PR4.5** | window resize + scale_factor detection | Currently hardcoded `DEFAULT_VIEWPORT = 800×1200` and `RENDER_SCALE = 2.0`. Subscribe to `window::resize_events`, repaginate on resize, read iced's actual scale_factor. | small/medium |
+| **PR6** | TOC nav, font-scale, theme toggle, error UI, README | Settings + chrome. TOC is exposed via `BookSource::spine()` with optional titles. Font-scale wires into `Theme::base_font_size`. Theme toggle wires light/dark. README has `cargo install --path .` instructions. | medium |
+
+Implementation plan in the `## Decision (ADR-lite)` and `## Technical Approach` sections still applies — those describe the design as planned; the deltas above record what actually changed during execution.
+
+### Notes for the next session
+
+* Active task `04-25-ereader-brainstorm` was paused at end of PR3.5 (current task pointer cleared via `python3 ./.trellis/scripts/task.py finish` if needed; otherwise `start` it again).
+* Subagent context (`implement.jsonl`, `check.jsonl`) is configured with the 5 backend specs + the code-reuse guide; no re-init needed for PR5/4.5/6 unless the dev_type changes.
+* Dogfood with `cargo run --release -- "/home/ethan/Documents/china-in-map/《地图中的中国通史》[上下册].epub"` — that's the de-facto acceptance test. Cover image on page 0, lists with `•`/numbered markers, CJK glyphs crisp at HiDPI.
+* User preferences observed:
+  * dark theme (locked)
+  * single-question-at-a-time brainstorm
+  * commit between every PR for clean rollback
+  * independent check-agent review after every implement-agent run
+  * no `git commit` without explicit user go-ahead
+* Read-source-not-just-docs rule is now empirical: two bugs in this session both came from trusting third-party API docs that didn't spell out the actual behaviour. PR5+ should default to skimming the cosmic-text/iced/swash/image source when integrating a new method.
