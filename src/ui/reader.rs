@@ -14,10 +14,11 @@ use super::Message;
 /// Build the reader-view tree for a page that has already been rasterized
 /// into `handle`.
 ///
-/// The rasterized texture is rendered at HiDPI scale (see
-/// `super::RENDER_SCALE`); we ask iced to expand the image to fill the
-/// available logical area while preserving aspect ratio, so the high-res
-/// source maps to physical pixels with as little resampling as possible.
+/// The rasterized texture is rendered at the live HiDPI scale tracked on
+/// `App` (see `super::handle_rescaled`); we ask iced to expand the image
+/// to fill the available logical area while preserving aspect ratio, so
+/// the high-res source maps to physical pixels with as little resampling
+/// as possible.
 pub(crate) fn view(handle: Handle, status: Option<&str>) -> Element<'_, Message> {
     let img = image(handle)
         .content_fit(iced::ContentFit::Contain)

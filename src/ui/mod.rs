@@ -6,6 +6,12 @@
 //! - [`render`] rasterizes a paginated page into an RGBA8 pixel buffer.
 //! - [`reader`] arranges the widget tree (image + status line).
 //!
+//! PR4.5 added live window-resize and HiDPI `scale_factor` tracking: the
+//! viewport and `render_scale` are now app state, fed by the
+//! [`window::Event::Resized`] / [`window::Event::Rescaled`] event stream
+//! (see [`window_subscription`]). Resize is debounced to avoid
+//! re-paginating per frame during a drag.
+//!
 //! Only [`run`] / [`run_with_optional_path`] are exposed to the rest of the
 //! crate.
 
@@ -16,11 +22,11 @@ mod worker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic_text::{FontSystem, SwashCache};
 use iced::widget::image::Handle;
-use iced::{Subscription, Task, Theme as IcedTheme, event, keyboard};
+use iced::{Size, Subscription, Task, Theme as IcedTheme, event, keyboard, window};
 
 use crate::error::{Error, Result};
 use crate::format::{BookSource, EpubSource};
@@ -30,21 +36,42 @@ use crate::persistence::RecentsStore;
 use self::render::PageImage;
 use self::worker::{WorkerHandle, WorkerRequest, WorkerResponse};
 
-/// Default page viewport (logical px). Matches the PR3 bench harness so
-/// pagination measurements line up.
+/// Cold-start fallback viewport (logical px), used until iced reports the
+/// first window size via [`window::resize_events`]. Also matches the PR3
+/// bench harness so pagination measurements line up.
 const DEFAULT_VIEWPORT: Viewport = Viewport {
     width: 800.0,
     height: 1200.0,
 };
 
 /// Approximate frame-pacing tick used by the response-poll subscription.
+/// Also drives the resize-debounce check (see [`commit_pending_resize`]).
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Pixel-density multiplier for rasterized pages. The layout viewport is in
-/// logical pixels; we render the texture at `viewport * RENDER_SCALE` so
-/// HiDPI displays don't have to upsample our buffer (which produced visible
-/// blur at 1.0). PR4.5 will read the actual `scale_factor` from iced.
-const RENDER_SCALE: f32 = 2.0;
+/// Default pixel-density multiplier when iced has not yet reported a real
+/// `scale_factor`. The layout viewport is in logical pixels; we render the
+/// texture at `viewport * render_scale` so HiDPI displays don't have to
+/// upsample our buffer (which produced visible blur at 1.0).
+const DEFAULT_RENDER_SCALE: f32 = 2.0;
+
+/// Lower bound for the live render scale. Below 1.0 is meaningless (we'd
+/// be down-sampling the layout for no reason).
+const MIN_RENDER_SCALE: f32 = 1.0;
+
+/// Upper bound for the live render scale. Above 4.0 burns RAM with no
+/// perceivable gain on any commodity display.
+const MAX_RENDER_SCALE: f32 = 4.0;
+
+/// How long a series of resize events must be quiet before we re-paginate.
+/// During a drag-resize the OS emits dozens of `Resized` events per second;
+/// debouncing means we re-paginate once when the drag settles instead of
+/// queuing a paginate per frame.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Lower bound on the viewport area we'll accept from a resize event.
+/// Some compositors emit a 0×0 [`Size`] during minimize/restore — paginating
+/// against that would divide by zero in the layout engine.
+const MIN_VIEWPORT_DIM: f32 = 64.0;
 
 /// Per-chapter state on the UI side.
 enum ChapterState {
@@ -58,7 +85,6 @@ struct OpenBook {
     chapters: Vec<ChapterState>,
     current_chapter: usize,
     current_page_in_chapter: usize,
-    viewport: Viewport,
     worker: WorkerHandle,
     /// Cached rasterized image for the current page so view() doesn't
     /// re-rasterize on every redraw.
@@ -66,6 +92,11 @@ struct OpenBook {
     /// Stable identifier under which this book is tracked in the
     /// [`RecentsStore`]. Set at open time; used to push progress updates.
     persistence_key: String,
+    /// When a resize triggers a re-paginate, we capture the cursor's
+    /// position-within-chapter as a fraction in `[0.0, 1.0)` so we can snap
+    /// the new pagination to the same logical place. `None` means no
+    /// repagination is in flight (or the cursor was already at page 0).
+    pending_position_fraction: Option<f32>,
 }
 
 struct CachedPage {
@@ -89,6 +120,25 @@ struct App {
     /// Recents + reading-position store. Owned by the UI thread; no
     /// concurrency needed (single writer, see PR5 sub-decisions).
     recents: RecentsStore,
+    /// Live logical viewport. Seeded from [`DEFAULT_VIEWPORT`]; updated
+    /// (after debounce) from `Event::Window(Resized)`.
+    viewport: Viewport,
+    /// Live HiDPI multiplier passed to [`render::render_page`]. Seeded from
+    /// [`DEFAULT_RENDER_SCALE`]; updated when iced reports the actual
+    /// `scale_factor` (or fires `Event::Window(Rescaled)`). Always clamped
+    /// to `[MIN_RENDER_SCALE, MAX_RENDER_SCALE]`.
+    render_scale: f32,
+    /// Latest resize event we have NOT yet acted on, plus the deadline at
+    /// which we will. The poll subscription checks this every
+    /// [`POLL_INTERVAL`] and commits once `Instant::now() >= deadline`.
+    /// Resetting this to `Some(_)` extends the deadline — that's the
+    /// debounce.
+    pending_resize: Option<(Size, Instant)>,
+    /// `true` while a resize is being handled and we're waiting for the
+    /// current chapter to come back from the worker. Suppresses
+    /// [`persist_progress`] so we don't write a stale `(chapter, page)`
+    /// pair against the new page-count.
+    repaginating: bool,
 }
 
 impl App {
@@ -105,6 +155,10 @@ impl App {
             swash_cache: SwashCache::new(),
             theme: LayoutTheme::dark(),
             recents,
+            viewport: DEFAULT_VIEWPORT,
+            render_scale: DEFAULT_RENDER_SCALE,
+            pending_resize: None,
+            repaginating: false,
         }
     }
 }
@@ -118,8 +172,17 @@ pub(crate) enum Message {
     OpenFromRecents(PathBuf),
     /// User pressed a navigation key.
     Nav(NavCommand),
-    /// Tick from the response-poll subscription. Drains the worker channel.
+    /// Tick from the response-poll subscription. Drains the worker channel
+    /// AND commits a debounced resize if its deadline has passed.
     DrainWorker,
+    /// Window's logical inner-size changed. Stored as `pending_resize` and
+    /// committed after [`RESIZE_DEBOUNCE`] to avoid re-paginating on every
+    /// frame of a drag-resize.
+    Resized(Size),
+    /// Window's HiDPI `scale_factor` changed (or was reported for the
+    /// first time). Re-rasterizes the cached page; layout is unaffected
+    /// because page boundaries depend on the *logical* viewport only.
+    Rescaled(f32),
     /// Catch-all for keyboard events we want to ignore.
     Ignored,
 }
@@ -155,6 +218,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::DrainWorker => {
             drain_worker(app);
+            commit_pending_resize(app);
+            Task::none()
+        }
+        Message::Resized(size) => {
+            handle_resized(app, size);
+            Task::none()
+        }
+        Message::Rescaled(factor) => {
+            handle_rescaled(app, factor);
             Task::none()
         }
         Message::Ignored => Task::none(),
@@ -206,17 +278,17 @@ fn handle_open(app: &mut App, path: PathBuf) {
         chapters,
         current_chapter: start_chapter,
         current_page_in_chapter: start_page,
-        viewport: DEFAULT_VIEWPORT,
         worker,
         cached: None,
         persistence_key,
+        pending_position_fraction: None,
     };
     // Always request chapter 0 for the empty-chapter scan; if the user
     // resumed past it, also request the resume chapter so the reader
     // doesn't sit on "paginating…" any longer than necessary.
-    request_chapter(&mut open, 0, &app.theme);
+    request_chapter(&mut open, 0, app.viewport, &app.theme);
     if start_chapter != 0 {
-        request_chapter(&mut open, start_chapter, &app.theme);
+        request_chapter(&mut open, start_chapter, app.viewport, &app.theme);
     }
     app.book = Some(open);
     app.status = Some(format!("opened: {}", path.display()));
@@ -269,7 +341,12 @@ fn global_page_progress(book: &OpenBook) -> (Option<usize>, Option<usize>) {
     (Some(global), Some(total))
 }
 
-fn request_chapter(book: &mut OpenBook, chapter_index: usize, theme: &LayoutTheme) {
+fn request_chapter(
+    book: &mut OpenBook,
+    chapter_index: usize,
+    viewport: Viewport,
+    theme: &LayoutTheme,
+) {
     let Some(state) = book.chapters.get_mut(chapter_index) else {
         return;
     };
@@ -279,7 +356,7 @@ fn request_chapter(book: &mut OpenBook, chapter_index: usize, theme: &LayoutThem
     *state = ChapterState::Pending;
     let req = WorkerRequest::Paginate {
         chapter_index,
-        viewport: book.viewport,
+        viewport,
         theme: theme.clone(),
     };
     if let Err(err) = book.worker.send(req) {
@@ -290,6 +367,7 @@ fn request_chapter(book: &mut OpenBook, chapter_index: usize, theme: &LayoutThem
 
 fn drain_worker(app: &mut App) {
     let theme = app.theme.clone();
+    let viewport = app.viewport;
     let Some(book) = app.book.as_mut() else {
         return;
     };
@@ -297,6 +375,8 @@ fn drain_worker(app: &mut App) {
     if responses.is_empty() {
         return;
     }
+    let current_before = book.current_chapter;
+    let mut current_just_loaded = false;
     for response in responses {
         match response {
             WorkerResponse::Paginated {
@@ -305,6 +385,9 @@ fn drain_worker(app: &mut App) {
             } => {
                 if chapter_index < book.chapters.len() {
                     book.chapters[chapter_index] = ChapterState::Loaded(chapter);
+                    if chapter_index == current_before {
+                        current_just_loaded = true;
+                    }
                 }
             }
             WorkerResponse::Failed {
@@ -318,6 +401,23 @@ fn drain_worker(app: &mut App) {
             }
         }
     }
+    // If we were waiting on the current chapter to come back (post-resize),
+    // snap to the saved fractional position before letting other logic run.
+    if current_just_loaded
+        && let Some(fraction) = book.pending_position_fraction.take()
+        && let Some(ChapterState::Loaded(c)) = book.chapters.get(book.current_chapter)
+    {
+        let pages = c.page_count();
+        if pages > 0 {
+            // Floor-cast: a fraction of 0.99 against an 8-page chapter
+            // lands on page 7 (last), which is what the user expects.
+            let target = (fraction * pages as f32).floor() as usize;
+            book.current_page_in_chapter = target.min(pages - 1);
+        } else {
+            book.current_page_in_chapter = 0;
+        }
+        book.cached = None;
+    }
     // After draining, walk forward over empty/failed chapters until we find
     // one with at least one page. This is the "skip empty ch000" behaviour.
     advance_past_empty(book);
@@ -325,13 +425,28 @@ fn drain_worker(app: &mut App) {
     // (e.g. canonical EPUB: ch000 is empty so we move to ch001 which was
     // never requested). Without this, the UI sticks on "paginating…".
     if book.current_chapter < book.chapters.len() {
-        request_chapter(book, book.current_chapter, &theme);
+        request_chapter(book, book.current_chapter, viewport, &theme);
     }
     // Invalidate cache; renderer will re-rasterize on next view.
     book.cached = None;
     // Prefetch next chapter once the current one is loaded.
     if let Some(next) = next_chapter_to_prefetch(book) {
-        request_chapter(book, next, &theme);
+        request_chapter(book, next, viewport, &theme);
+    }
+
+    // If the current chapter is loaded and there are no outstanding
+    // post-resize paginations, the resize is fully settled — re-enable
+    // persistence (which was suppressed while `repaginating` was true).
+    if app.repaginating
+        && let Some(book) = app.book.as_ref()
+        && book.pending_position_fraction.is_none()
+        && matches!(
+            book.chapters.get(book.current_chapter),
+            Some(ChapterState::Loaded(_))
+        )
+    {
+        app.repaginating = false;
+        persist_progress(app);
     }
 }
 
@@ -351,6 +466,122 @@ fn advance_past_empty(book: &mut OpenBook) {
     }
 }
 
+/// Stash a resize event for the debounce timer. Called on every
+/// `Event::Window(Resized | Opened)`. Coalesces with any in-flight pending
+/// resize: each new event extends the deadline by [`RESIZE_DEBOUNCE`].
+fn handle_resized(app: &mut App, size: Size) {
+    // Reject zero/negative/absurdly small sizes — some compositors emit a
+    // 0×0 `Resized` during minimize/restore, and pagination would divide by
+    // zero or produce a single-glyph page.
+    if !size.width.is_finite()
+        || !size.height.is_finite()
+        || size.width < MIN_VIEWPORT_DIM
+        || size.height < MIN_VIEWPORT_DIM
+    {
+        tracing::trace!(?size, "ignoring undersized resize event");
+        return;
+    }
+    let deadline = Instant::now() + RESIZE_DEBOUNCE;
+    app.pending_resize = Some((size, deadline));
+}
+
+/// If a pending resize's debounce window has elapsed, swap the live
+/// viewport, capture the cursor's fractional position, drop every cached
+/// pagination, and re-request the current chapter.
+///
+/// Called from the [`POLL_INTERVAL`] tick (i.e. ~60 Hz). When the user is
+/// mid-drag we just keep extending the deadline in [`handle_resized`], so
+/// nothing actually re-paginates until the drag settles.
+fn commit_pending_resize(app: &mut App) {
+    let Some((size, deadline)) = app.pending_resize else {
+        return;
+    };
+    if Instant::now() < deadline {
+        return;
+    }
+    app.pending_resize = None;
+    let new_viewport = Viewport {
+        width: size.width,
+        height: size.height,
+    };
+    // No-op if dimensions match (debounced redundant resizes).
+    if (new_viewport.width - app.viewport.width).abs() < f32::EPSILON
+        && (new_viewport.height - app.viewport.height).abs() < f32::EPSILON
+    {
+        return;
+    }
+    tracing::info!(
+        from_w = app.viewport.width,
+        from_h = app.viewport.height,
+        to_w = new_viewport.width,
+        to_h = new_viewport.height,
+        "viewport resized; re-paginating"
+    );
+    app.viewport = new_viewport;
+
+    let theme = app.theme.clone();
+    let viewport = app.viewport;
+    let Some(book) = app.book.as_mut() else {
+        return;
+    };
+
+    // Capture position-within-current-chapter as a fraction so we can land
+    // on roughly the same logical place after re-pagination.
+    let current_index = book.current_chapter;
+    let fraction = match book.chapters.get(current_index) {
+        Some(ChapterState::Loaded(c)) if c.page_count() > 0 => {
+            Some(book.current_page_in_chapter as f32 / c.page_count() as f32)
+        }
+        _ => None,
+    };
+    book.pending_position_fraction = fraction;
+
+    // Drop every pagination — page boundaries depend on the viewport, so
+    // every cached chapter is now stale. The next-chapter prefetch path in
+    // `drain_worker` will re-request adjacent chapters as needed.
+    for state in book.chapters.iter_mut() {
+        *state = ChapterState::NotRequested;
+    }
+    book.cached = None;
+    request_chapter(book, current_index, viewport, &theme);
+    app.repaginating = true;
+}
+
+/// Update the live render scale and invalidate the rasterized cache.
+/// Layout is unaffected: page boundaries depend only on the *logical*
+/// viewport, so we don't re-paginate.
+fn handle_rescaled(app: &mut App, factor: f32) {
+    if !factor.is_finite() || factor <= 0.0 {
+        tracing::warn!(factor, "ignoring non-positive scale_factor");
+        return;
+    }
+    let clamped = factor.clamp(MIN_RENDER_SCALE, MAX_RENDER_SCALE);
+    if (clamped - factor).abs() > f32::EPSILON {
+        // Surface clamping in production logs so HiDPI bugs (a desktop
+        // compositor reporting a wild scale) are observable, not silent.
+        tracing::warn!(
+            raw = factor,
+            clamped,
+            min = MIN_RENDER_SCALE,
+            max = MAX_RENDER_SCALE,
+            "scale_factor outside supported range; clamped"
+        );
+    }
+    if (clamped - app.render_scale).abs() < f32::EPSILON {
+        return;
+    }
+    tracing::info!(
+        from = app.render_scale,
+        to = clamped,
+        raw = factor,
+        "render scale changed; dropping rasterized cache"
+    );
+    app.render_scale = clamped;
+    if let Some(book) = app.book.as_mut() {
+        book.cached = None;
+    }
+}
+
 fn next_chapter_to_prefetch(book: &OpenBook) -> Option<usize> {
     let next = book.current_chapter + 1;
     if next >= book.chapters.len() {
@@ -361,12 +592,14 @@ fn next_chapter_to_prefetch(book: &OpenBook) -> Option<usize> {
 
 fn handle_nav(app: &mut App, cmd: NavCommand) {
     let theme = app.theme.clone();
+    let viewport = app.viewport;
+    let repaginating = app.repaginating;
     let Some(book) = app.book.as_mut() else {
         return;
     };
     let before = (book.current_chapter, book.current_page_in_chapter);
     match cmd {
-        NavCommand::NextPage => nav_next_page(book, &theme),
+        NavCommand::NextPage => nav_next_page(book, viewport, &theme),
         NavCommand::PrevPage => nav_prev_page(book, &theme),
         NavCommand::FirstPage => {
             book.current_page_in_chapter = 0;
@@ -386,7 +619,7 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
                 book.current_chapter = n;
                 book.current_page_in_chapter = 0;
                 book.cached = None;
-                request_chapter(book, n, &theme);
+                request_chapter(book, n, viewport, &theme);
             }
         }
         NavCommand::PrevChapter => {
@@ -398,12 +631,15 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
         }
     }
     let after = (book.current_chapter, book.current_page_in_chapter);
-    if after != before {
+    // While a re-paginate is in flight the saved (chapter, page) pair would
+    // be measured against the *old* page-count — defer until the worker
+    // returns and `drain_worker` flips `repaginating` back off.
+    if after != before && !repaginating {
         persist_progress(app);
     }
 }
 
-fn nav_next_page(book: &mut OpenBook, theme: &LayoutTheme) {
+fn nav_next_page(book: &mut OpenBook, viewport: Viewport, theme: &LayoutTheme) {
     let total_chapters = book.chapters.len();
     let current_pages = match &book.chapters[book.current_chapter] {
         ChapterState::Loaded(c) => c.page_count(),
@@ -423,7 +659,7 @@ fn nav_next_page(book: &mut OpenBook, theme: &LayoutTheme) {
                     book.current_chapter = idx;
                     book.current_page_in_chapter = 0;
                     book.cached = None;
-                    request_chapter(book, idx + 1, theme);
+                    request_chapter(book, idx + 1, viewport, theme);
                     return;
                 }
                 idx += 1;
@@ -434,7 +670,7 @@ fn nav_next_page(book: &mut OpenBook, theme: &LayoutTheme) {
                 book.current_chapter = idx;
                 book.current_page_in_chapter = 0;
                 book.cached = None;
-                request_chapter(book, idx, theme);
+                request_chapter(book, idx, viewport, theme);
                 return;
             }
             ChapterState::Failed(_) => {
@@ -508,7 +744,7 @@ fn view(app: &App) -> iced::Element<'_, Message> {
             // No cache yet — paint a flat background. `ensure_cache` runs
             // from `update_with_cache` before view, so this path only fires
             // on the very first frame after open / on missing chapter data.
-            let blank = blank_image(book.viewport, app.theme.bg_color);
+            let blank = blank_image(app.viewport, app.theme.bg_color);
             Handle::from_rgba(blank.width, blank.height, blank.pixels)
         }
     };
@@ -536,10 +772,11 @@ fn blank_image(viewport: Viewport, bg: cosmic_text::Color) -> PageImage {
 /// Called from `update` (where `&mut App` is available) before view runs.
 fn ensure_cache(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = match app.book.as_ref() {
-        Some(b) => b.viewport,
-        None => return,
-    };
+    let viewport = app.viewport;
+    let render_scale = app.render_scale;
+    if app.book.is_none() {
+        return;
+    }
 
     let needs_rebuild = match app.book.as_ref() {
         Some(book) => match book.cached.as_ref() {
@@ -574,7 +811,7 @@ fn ensure_cache(app: &mut App) {
         &chapter,
         viewport,
         &theme,
-        RENDER_SCALE,
+        render_scale,
         &mut app.font_system,
         &mut app.swash_cache,
     );
@@ -594,7 +831,28 @@ fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(POLL_INTERVAL).map(|_| Message::DrainWorker),
         keyboard_subscription(),
+        window_subscription(),
     ])
+}
+
+/// Listen for window-level events that affect layout or rasterization:
+/// `Resized` feeds the debounced re-paginate path, `Rescaled` invalidates
+/// the rasterized cache so HiDPI changes pick up immediately.
+///
+/// iced 0.14 exposes `window::resize_events()` which already filters to
+/// `Resized` only; we use the raw event stream here so we can also catch
+/// `Rescaled` (and any future window event we want to react to) with one
+/// subscription. Per-monitor DPI changes mid-session work to the extent
+/// that the windowing backend (winit) emits a `Rescaled` event when the
+/// window is dragged across screens with different `scale_factor` — on
+/// some compositors that doesn't happen until focus returns.
+fn window_subscription() -> Subscription<Message> {
+    event::listen_with(|ev, _status, _id| match ev {
+        iced::Event::Window(window::Event::Resized(size)) => Some(Message::Resized(size)),
+        iced::Event::Window(window::Event::Opened { size, .. }) => Some(Message::Resized(size)),
+        iced::Event::Window(window::Event::Rescaled(factor)) => Some(Message::Rescaled(factor)),
+        _ => None,
+    })
 }
 
 fn keyboard_subscription() -> Subscription<Message> {
@@ -675,7 +933,9 @@ fn update_with_cache(app: &mut App, message: Message) -> Task<Message> {
 ///
 /// Always rasterizes at scale 1.0 so existing benches/tests can assert on
 /// `viewport.width × viewport.height` pixel dimensions. Production code
-/// goes through [`ensure_cache`] which uses [`RENDER_SCALE`] for HiDPI.
+/// goes through [`ensure_cache`], which passes the live `App::render_scale`
+/// (seeded from [`DEFAULT_RENDER_SCALE`], updated by [`handle_rescaled`])
+/// so HiDPI displays render at native pixel density.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn render_page_for_bench(
     page: &crate::layout::Page,
