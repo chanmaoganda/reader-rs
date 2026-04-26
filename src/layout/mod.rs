@@ -99,6 +99,32 @@ impl Theme {
             muted_color: Color::rgb(0x60, 0x5a, 0x52),
         }
     }
+
+    /// `true` if this theme is a dark palette (background luminance below
+    /// the midpoint). Used by the iced shell to pick a matching chrome
+    /// theme without holding a separate flag in [`crate::ui`].
+    ///
+    /// Implemented by comparing the background's perceptual luminance to
+    /// `0.5`, so user-supplied palettes (future PR) classify correctly
+    /// without extra plumbing.
+    #[must_use]
+    pub fn is_dark(&self) -> bool {
+        let (r, g, b, _) = self.bg_color.as_rgba_tuple();
+        // Rec. 601 luma — good enough for "dark vs light chrome".
+        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        luma < 128.0
+    }
+
+    /// Return a copy of this theme with `base_font_size` replaced.
+    ///
+    /// Heading sizes scale relative to `base_font_size` in the cascade
+    /// (see [`crate::layout::style::Cascade::for_element`]) so the
+    /// hierarchy is preserved automatically.
+    #[must_use]
+    pub fn with_font_size(mut self, base_font_size: f32) -> Self {
+        self.base_font_size = base_font_size;
+        self
+    }
 }
 
 impl Default for Theme {

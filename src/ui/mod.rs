@@ -73,6 +73,21 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// against that would divide by zero in the layout engine.
 const MIN_VIEWPORT_DIM: f32 = 64.0;
 
+/// Smallest base font size the toolbar will let the user select. Below this,
+/// CJK glyphs lose strokes at typical HiDPI scales.
+const MIN_FONT_SIZE: f32 = 12.0;
+
+/// Largest base font size the toolbar will let the user select. Beyond this,
+/// even short paragraphs spill across many pages.
+const MAX_FONT_SIZE: f32 = 32.0;
+
+/// Default base font size when the user resets via the `0` hotkey or the
+/// reset button. Matches [`LayoutTheme::dark`] / [`LayoutTheme::light`].
+const DEFAULT_FONT_SIZE: f32 = 16.0;
+
+/// Step (in px) applied by `+` / `-` hotkeys and the `A-` / `A+` buttons.
+const FONT_SIZE_STEP: f32 = 1.0;
+
 /// Per-chapter state on the UI side.
 enum ChapterState {
     NotRequested,
@@ -189,8 +204,32 @@ pub(crate) enum Message {
     /// first time). Re-rasterizes the cached page; layout is unaffected
     /// because page boundaries depend on the *logical* viewport only.
     Rescaled(f32),
+    /// User toggled the theme (light ↔ dark). Triggers a re-paginate via
+    /// [`apply_theme_change`].
+    ToggleTheme,
+    /// User picked a new base font size (absolute, in px). Clamped to
+    /// `[MIN_FONT_SIZE, MAX_FONT_SIZE]`. Triggers a re-paginate via
+    /// [`apply_theme_change`].
+    FontSizeChanged(f32),
+    /// User pressed `+` / `-` / `0`. Resolved against the current
+    /// [`LayoutTheme::base_font_size`] and dispatched as
+    /// [`Message::FontSizeChanged`] with the resulting absolute size.
+    /// Carrying a delta keeps `map_key` free of `App` references.
+    FontSizeAdjust(FontSizeAdjust),
     /// Catch-all for keyboard events we want to ignore.
     Ignored,
+}
+
+/// Hotkey-driven font-size adjustments. The resolved absolute size is
+/// computed in [`update`] where the live [`LayoutTheme`] is available.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FontSizeAdjust {
+    /// Increase by [`FONT_SIZE_STEP`].
+    Increase,
+    /// Decrease by [`FONT_SIZE_STEP`].
+    Decrease,
+    /// Reset to [`DEFAULT_FONT_SIZE`].
+    Reset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -239,8 +278,79 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             handle_rescaled(app, factor);
             Task::none()
         }
+        Message::ToggleTheme => {
+            let next = if app.theme.is_dark() {
+                LayoutTheme::light().with_font_size(app.theme.base_font_size)
+            } else {
+                LayoutTheme::dark().with_font_size(app.theme.base_font_size)
+            };
+            tracing::info!(
+                from_dark = app.theme.is_dark(),
+                to_dark = next.is_dark(),
+                "theme toggled"
+            );
+            apply_theme_change(app, next);
+            Task::none()
+        }
+        Message::FontSizeChanged(size) => {
+            let clamped = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+            if (clamped - app.theme.base_font_size).abs() < f32::EPSILON {
+                return Task::none();
+            }
+            tracing::info!(
+                from = app.theme.base_font_size,
+                to = clamped,
+                requested = size,
+                "font size changed"
+            );
+            let next = app.theme.clone().with_font_size(clamped);
+            apply_theme_change(app, next);
+            Task::none()
+        }
+        Message::FontSizeAdjust(delta) => {
+            let target = match delta {
+                FontSizeAdjust::Increase => app.theme.base_font_size + FONT_SIZE_STEP,
+                FontSizeAdjust::Decrease => app.theme.base_font_size - FONT_SIZE_STEP,
+                FontSizeAdjust::Reset => DEFAULT_FONT_SIZE,
+            };
+            update(app, Message::FontSizeChanged(target))
+        }
         Message::Ignored => Task::none(),
     }
+}
+
+/// Replace the live theme and re-paginate the current chapter without a
+/// viewport change. Mirrors [`commit_pending_resize`]: capture the cursor's
+/// position-within-chapter as a fraction, reset every chapter cache to
+/// `NotRequested`, drop the rasterized image, mark `repaginating`, and
+/// re-request the current chapter.
+///
+/// Page boundaries depend on the theme (font size, line height, margins),
+/// so every cached chapter is now stale. The next-chapter prefetch path in
+/// [`drain_worker`] re-requests adjacent chapters as needed.
+fn apply_theme_change(app: &mut App, new_theme: LayoutTheme) {
+    app.theme = new_theme;
+    let theme = app.theme.clone();
+    let viewport = app.viewport;
+    let Some(book) = app.book.as_mut() else {
+        return;
+    };
+
+    let current_index = book.current_chapter;
+    let fraction = match book.chapters.get(current_index) {
+        Some(ChapterState::Loaded(c)) if c.page_count() > 0 => {
+            Some(book.current_page_in_chapter as f32 / c.page_count() as f32)
+        }
+        _ => None,
+    };
+    book.pending_position_fraction = fraction;
+
+    for state in book.chapters.iter_mut() {
+        *state = ChapterState::NotRequested;
+    }
+    book.cached = None;
+    request_chapter(book, current_index, viewport, &theme);
+    app.repaginating = true;
 }
 
 /// Pop the native "Open file…" dialog and, on selection, hand the chosen
@@ -783,7 +893,12 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         }
     };
 
-    reader::view(handle, app.status.as_deref())
+    reader::view(
+        handle,
+        app.status.as_deref(),
+        app.theme.is_dark(),
+        app.theme.base_font_size,
+    )
 }
 
 fn blank_image(viewport: Viewport, bg: cosmic_text::Color) -> PageImage {
@@ -920,13 +1035,36 @@ fn map_key(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Message {
         keyboard::Key::Named(Named::PageUp) => NavCommand::PrevPage,
         keyboard::Key::Named(Named::Home) => NavCommand::FirstPage,
         keyboard::Key::Named(Named::End) => NavCommand::LastPage,
+        keyboard::Key::Character(s) => return map_character_key(s.as_ref()),
         _ => return Message::Ignored,
     };
     Message::Nav(nav)
 }
 
-fn iced_theme(_app: &App) -> IcedTheme {
-    IcedTheme::Dark
+/// Map character-producing keys to non-nav messages.
+///
+/// Hotkeys: `t` toggle theme, `+` / `=` increase font size, `-` decrease,
+/// `0` reset to [`DEFAULT_FONT_SIZE`]. Nothing else is bound — kept
+/// deliberately small so we don't shadow keys the user might type into a
+/// future search/jump field.
+fn map_character_key(s: &str) -> Message {
+    // `=` is the unshifted glyph on the same physical key as `+` on US
+    // layouts; accept both so the user doesn't need to hold shift.
+    match s {
+        "t" | "T" => Message::ToggleTheme,
+        "+" | "=" => Message::FontSizeAdjust(FontSizeAdjust::Increase),
+        "-" | "_" => Message::FontSizeAdjust(FontSizeAdjust::Decrease),
+        "0" => Message::FontSizeAdjust(FontSizeAdjust::Reset),
+        _ => Message::Ignored,
+    }
+}
+
+fn iced_theme(app: &App) -> IcedTheme {
+    if app.theme.is_dark() {
+        IcedTheme::Dark
+    } else {
+        IcedTheme::Light
+    }
 }
 
 /// Boot the iced runtime and run the application until the window closes.
