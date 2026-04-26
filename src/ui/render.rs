@@ -183,9 +183,21 @@ fn draw_image_slice(
     }
 }
 
-/// Nearest-neighbour blit of an RGBA8 source into the page buffer at
-/// `(dst_x0, dst_y0)`, scaled to `(dst_w, dst_h)`. Alpha is treated as
-/// opaque (ignored). Pixels outside the buffer are clipped.
+/// Nearest-neighbour blit of a straight-RGBA8 source into the page buffer
+/// at `(dst_x0, dst_y0)`, scaled to `(dst_w, dst_h)`. Pixels outside the
+/// buffer are clipped.
+///
+/// The source alpha drives a source-over composite against the existing
+/// destination pixel — the page buffer is filled with `theme.bg_color`
+/// before blits start (see [`render_page`]), so transparent regions of an
+/// illustration correctly show the page background instead of whatever
+/// stale RGB happens to live in the source's transparent pixels (typically
+/// `(0, 0, 0)` = solid black, which made line-art illustrations on
+/// transparent backgrounds appear as solid black rectangles). Both PNG/JPG
+/// (`image::to_rgba8`) and the SVG path (which demultiplies in
+/// [`crate::layout::paginate::decode_svg`]) feed straight RGBA, so this
+/// composite is correct for both. Output alpha is forced opaque since the
+/// page texture itself is presented opaque to iced.
 #[allow(clippy::too_many_arguments)]
 fn blit_rgba_scaled(
     img: &mut PageImage,
@@ -223,9 +235,24 @@ fn blit_rgba_scaled(
             let sx = sx.clamp(0, src_w_i - 1);
             let si = src_row + (sx as usize) * 4;
             let di = dst_row + (px as usize) * 4;
-            img.pixels[di] = src[si];
-            img.pixels[di + 1] = src[si + 1];
-            img.pixels[di + 2] = src[si + 2];
+            // Source-over: out = src.rgb * a + dst.rgb * (255 - a), rounded.
+            // Fast paths for fully opaque / fully transparent source pixels
+            // skip the multiply; the dominant case for a typical book cover
+            // (alpha == 255 throughout) hits the opaque branch.
+            let a = src[si + 3] as u32;
+            if a == 255 {
+                img.pixels[di] = src[si];
+                img.pixels[di + 1] = src[si + 1];
+                img.pixels[di + 2] = src[si + 2];
+            } else if a != 0 {
+                let inv = 255 - a;
+                img.pixels[di] =
+                    ((src[si] as u32 * a + img.pixels[di] as u32 * inv + 127) / 255) as u8;
+                img.pixels[di + 1] =
+                    ((src[si + 1] as u32 * a + img.pixels[di + 1] as u32 * inv + 127) / 255) as u8;
+                img.pixels[di + 2] =
+                    ((src[si + 2] as u32 * a + img.pixels[di + 2] as u32 * inv + 127) / 255) as u8;
+            }
             img.pixels[di + 3] = 0xFF;
         }
     }
@@ -590,5 +617,65 @@ mod tests {
             "scale=2 should cover substantially more pixels than scale=1: \
              n1={n1}, n2={n2}"
         );
+    }
+
+    /// Regression for the "transparent illustration paints solid black" bug:
+    /// EPUB line-art / illustration PNGs often store `RGB=(0,0,0)` in their
+    /// transparent pixels. The previous blit ignored alpha and forced
+    /// `alpha = 0xFF`, so transparent regions overwrote the page background
+    /// with opaque black — making chapters with such images render as a
+    /// solid black rectangle on the page.
+    ///
+    /// This test seeds a `PageImage` with a known background, blits a 2×2
+    /// source whose pixels span (transparent black, semi-transparent white,
+    /// opaque red, opaque green), and asserts source-over composite:
+    /// transparent pixels keep the bg, opaque pixels replace it, and
+    /// alpha=128 white blends to ~halfway between bg and white.
+    #[test]
+    fn blit_alpha_composites_against_background() {
+        let bg = (40u8, 40u8, 40u8, 0xFFu8);
+        let mut img = PageImage {
+            width: 2,
+            height: 2,
+            pixels: [bg.0, bg.1, bg.2, bg.3].repeat(4),
+        };
+
+        // 2×2 source: top-left transparent, top-right semi-transparent
+        // white, bottom-left opaque red, bottom-right opaque green.
+        let src: [u8; 16] = [
+            0, 0, 0, 0, 255, 255, 255, 128, 255, 0, 0, 255, 0, 255, 0, 255,
+        ];
+
+        blit_rgba_scaled(&mut img, &src, 2, 2, 0, 0, 2, 2);
+
+        let p = |x: usize, y: usize| {
+            let i = (y * 2 + x) * 4;
+            (
+                img.pixels[i],
+                img.pixels[i + 1],
+                img.pixels[i + 2],
+                img.pixels[i + 3],
+            )
+        };
+
+        // Transparent source must NOT clobber bg (this is the bug we fixed).
+        assert_eq!(
+            p(0, 0),
+            bg,
+            "transparent source pixel should leave bg untouched"
+        );
+
+        // Opaque source overwrites bg.
+        assert_eq!(p(0, 1), (255, 0, 0, 0xFF));
+        assert_eq!(p(1, 1), (0, 255, 0, 0xFF));
+
+        // Semi-transparent white over dark bg: each channel ≈ (255*128 +
+        // 40*127 + 127) / 255. Allow ±1 for rounding tolerance.
+        let (r, g, b, a) = p(1, 0);
+        let expected: u8 = ((255u32 * 128 + 40u32 * 127 + 127) / 255) as u8;
+        assert!(r.abs_diff(expected) <= 1, "r={r} expected≈{expected}");
+        assert!(g.abs_diff(expected) <= 1, "g={g} expected≈{expected}");
+        assert!(b.abs_diff(expected) <= 1, "b={b} expected≈{expected}");
+        assert_eq!(a, 0xFF, "output alpha must be opaque");
     }
 }
