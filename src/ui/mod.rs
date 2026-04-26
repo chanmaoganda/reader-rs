@@ -170,6 +170,12 @@ pub(crate) enum Message {
     /// Open the file at `path`, selected from the recents start screen.
     /// Routes through the same code path as [`Message::OpenPath`].
     OpenFromRecents(PathBuf),
+    /// User clicked the "Open file…" button. Pops the native file picker
+    /// (synchronously — `rfd` blocks the UI thread for the duration; this is
+    /// how every desktop reader handles it). On `Some(path)` we hand off to
+    /// the same [`handle_open`] flow as the other open variants. On `None`
+    /// (user cancelled) it's a no-op.
+    OpenViaPicker,
     /// User pressed a navigation key.
     Nav(NavCommand),
     /// Tick from the response-poll subscription. Drains the worker channel
@@ -212,6 +218,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             handle_open(app, path);
             Task::none()
         }
+        Message::OpenViaPicker => {
+            handle_open_via_picker(app);
+            Task::none()
+        }
         Message::Nav(cmd) => {
             handle_nav(app, cmd);
             Task::none()
@@ -233,6 +243,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 }
 
+/// Pop the native "Open file…" dialog and, on selection, hand the chosen
+/// path to [`handle_open`]. Cancellation is a silent no-op (debug-logged).
+///
+/// `rfd::FileDialog::pick_file` is synchronous: it blocks the UI thread until
+/// the dialog is dismissed. For a desktop reader that's the right ergonomics
+/// — the user expects the rest of the window to be unresponsive while the
+/// system file picker is up.
+fn handle_open_via_picker(app: &mut App) {
+    tracing::info!("opening native file picker");
+    let picked = rfd::FileDialog::new()
+        .add_filter("EPUB", &["epub"])
+        .pick_file();
+    match picked {
+        Some(path) => handle_open(app, path),
+        None => tracing::debug!("file picker cancelled by user"),
+    }
+}
+
 fn handle_open(app: &mut App, path: PathBuf) {
     let mut book = match EpubSource::open(&path) {
         Ok(b) => b,
@@ -248,6 +276,9 @@ fn handle_open(app: &mut App, path: PathBuf) {
         return;
     }
     tracing::info!(path = %path.display(), chapters = spine_len, "opened book");
+    // Open succeeded past every fallible gate — clear any stale error left
+    // over from a previous failed open so the new book actually renders.
+    app.error = None;
 
     // Compute persistence key and seed cursor from any saved progress
     // BEFORE we hand `book` to the worker (which takes ownership).
@@ -713,7 +744,10 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         if !app.recents.is_empty() {
             return recents::view(&app.recents);
         }
-        return reader::empty_view("drop a file or pass one as argv");
+        return reader::splash_view(
+            "no book open — pick an EPUB to start",
+            Message::OpenViaPicker,
+        );
     };
 
     let chapter_state = &book.chapters[book.current_chapter];

@@ -6,7 +6,7 @@
 //! widget tree.
 
 use iced::widget::image::Handle;
-use iced::widget::{Column, column, container, image, text};
+use iced::widget::{Column, button, column, container, image, row, text};
 use iced::{Center, Element, Fill};
 
 use super::Message;
@@ -38,10 +38,32 @@ pub(crate) fn view(handle: Handle, status: Option<&str>) -> Element<'_, Message>
     container(tree).center_x(Fill).center_y(Fill).into()
 }
 
-/// Splash shown when no book is open.
+/// Splash shown for transient/non-actionable states (errors, "paginating…",
+/// "(no page)"). Plain centered text — no buttons, since the user has nothing
+/// useful to do besides read the message.
 pub(crate) fn empty_view(message: &str) -> Element<'_, Message> {
     container(text(message).size(20))
         .center_x(Fill)
         .center_y(Fill)
         .into()
+}
+
+/// Splash shown on the very first launch (no book open and the recents store
+/// is empty). Offers an "Open file…" button that emits `on_open` when pressed.
+///
+/// Kept distinct from [`empty_view`] so the latter can stay a pure status
+/// display for error / loading states where there is no useful action to take.
+pub(crate) fn splash_view(message: &str, on_open: Message) -> Element<'_, Message> {
+    let body = column![
+        text(message).size(20),
+        row![
+            button(text("Open file…").size(16))
+                .on_press(on_open)
+                .padding([8, 16])
+        ],
+    ]
+    .spacing(16)
+    .align_x(Center);
+
+    container(body).center_x(Fill).center_y(Fill).into()
 }

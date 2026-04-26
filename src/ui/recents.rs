@@ -8,7 +8,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced::widget::image::Handle;
-use iced::widget::{Column, Row, button, column, container, image, row, text};
+use iced::widget::{Column, Row, Space, button, column, container, image, row, text};
 use iced::{Element, Fill, Length};
 
 use super::Message;
@@ -19,8 +19,18 @@ use crate::persistence::{RecentEntry, RecentsStore};
 /// Sorted most-recently-read first; capped to the visible entries the
 /// store currently holds (the store itself caps at `MAX_RECENTS`).
 pub(crate) fn view(store: &RecentsStore) -> Element<'_, Message> {
+    let header: Row<'_, Message> = row![
+        text("Recents").size(28),
+        Space::new().width(Fill),
+        button(text("Open file…").size(14))
+            .on_press(Message::OpenViaPicker)
+            .padding([6, 12]),
+    ]
+    .align_y(iced::Center)
+    .spacing(12);
+
     let mut tree: Column<'_, Message> =
-        column![container(text("Recents").size(28)).padding(16).width(Fill),].spacing(8);
+        column![container(header).padding(16).width(Fill)].spacing(8);
 
     let mut current_row: Row<'_, Message> = row![].spacing(12);
     let mut in_row = 0;
