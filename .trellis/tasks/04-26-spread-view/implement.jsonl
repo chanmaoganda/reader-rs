@@ -1,0 +1,7 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Backend conventions"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Backend conventions"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Backend conventions"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Backend conventions"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Spread view should reuse repaginate_all_with_snapback path, not duplicate it"}

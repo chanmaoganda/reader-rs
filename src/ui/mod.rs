@@ -95,6 +95,12 @@ const FONT_SIZE_STEP: f32 = 1.0;
 /// cursor's fractional position.
 const TOC_WIDTH: f32 = 280.0;
 
+/// Logical-pixel gap between the two facing pages in spread mode. Slim
+/// enough to avoid wasting reading area, wide enough to read as a clear
+/// page break. Subtracted from the available width before halving in
+/// [`App::effective_per_page_viewport`].
+pub(crate) const SPREAD_GUTTER: f32 = 24.0;
+
 /// Per-chapter state on the UI side.
 enum ChapterState {
     NotRequested,
@@ -134,6 +140,16 @@ struct CachedPage {
     /// every frame, re-uploads to the GPU, and the picture flickers.
     /// Handle is internally `Arc`-shared; `clone` is cheap.
     handle: Handle,
+    /// In spread mode, the rasterized right-slot page (i.e. page
+    /// `page_in_chapter + 1`). `None` when single-page mode is active OR
+    /// when the chapter has an odd page count and the current spread is
+    /// the trailing `(last, blank)` pair — the right slot is then drawn
+    /// as a blank `Space`.
+    right_handle: Option<Handle>,
+    /// `true` when the cache was built for spread layout. Used by
+    /// [`ensure_cache`] to invalidate when the user toggles spread without
+    /// changing the cursor.
+    spread: bool,
 }
 
 struct App {
@@ -169,6 +185,21 @@ struct App {
     /// (hotkey `O` or the toolbar button); shrinks the effective viewport by
     /// [`TOC_WIDTH`] which routes through the existing re-paginate path.
     toc_open: bool,
+    /// `true` when the user has requested two-page (facing-pages) layout.
+    /// Toggled by [`Message::ToggleSpread`] (hotkey `S` or the toolbar
+    /// button). Session-scoped, intentionally NOT persisted in v1.
+    ///
+    /// When active and the per-slot width clears [`MIN_VIEWPORT_DIM`], the
+    /// reader paginates against half the remaining viewport (after the TOC
+    /// width and [`SPREAD_GUTTER`]) and renders pages `(N, N+1)` side by
+    /// side. When the window is too narrow we transparently fall back to
+    /// single-page rendering — the flag stays set so resizing back up
+    /// restores the spread.
+    spread_mode: bool,
+    /// Tracks whether the most recent paginate/render decision used the
+    /// spread auto-fallback, so we can `tracing::debug!` once on transition
+    /// (entering or leaving fallback) instead of per frame.
+    spread_fallback_active: bool,
 }
 
 impl App {
@@ -190,10 +221,13 @@ impl App {
             pending_resize: None,
             repaginating: false,
             toc_open: false,
+            spread_mode: false,
+            spread_fallback_active: false,
         }
     }
 
-    /// Logical viewport actually available to the reader pane. Subtracts
+    /// Logical viewport actually available to the reader pane (the area
+    /// containing both spread slots, if spread mode is active). Subtracts
     /// the TOC sidebar width when [`App::toc_open`] is true; clamped to a
     /// floor of [`MIN_VIEWPORT_DIM`] so opening the TOC on a narrow window
     /// can never produce a non-positive paginate width.
@@ -206,6 +240,45 @@ impl App {
         } else {
             self.viewport
         }
+    }
+
+    /// Logical viewport handed to the paginator for a single page slot.
+    ///
+    /// In single-page mode (or in spread mode where the window is too
+    /// narrow to fit two pages — see [`App::spread_active`]) this is the
+    /// same as [`App::effective_viewport`]. In active spread mode it is
+    /// half of that, after subtracting [`SPREAD_GUTTER`], so two facing
+    /// pages plus the gutter add up to the reader pane width.
+    ///
+    /// Both this helper and [`App::spread_active`] must agree on whether
+    /// spread is in effect — a mismatch would have the paginator producing
+    /// half-width pages while the renderer drew them at full-width (or
+    /// vice versa).
+    fn effective_per_page_viewport(&self) -> Viewport {
+        let outer = self.effective_viewport();
+        if self.spread_active() {
+            let per_slot = ((outer.width - SPREAD_GUTTER) / 2.0).max(MIN_VIEWPORT_DIM);
+            Viewport {
+                width: per_slot,
+                height: outer.height,
+            }
+        } else {
+            outer
+        }
+    }
+
+    /// Whether spread mode is in effect *right now* — i.e. the user has
+    /// asked for it AND the per-slot width genuinely fits two pages plus
+    /// the gutter. Used by both the paginate path and the render path so
+    /// they stay in lockstep (a mismatch would render a half-width image
+    /// in a full-width slot).
+    fn spread_active(&self) -> bool {
+        if !self.spread_mode {
+            return false;
+        }
+        let outer = self.effective_viewport();
+        let per_slot = (outer.width - SPREAD_GUTTER) / 2.0;
+        per_slot >= MIN_VIEWPORT_DIM
     }
 }
 
@@ -251,6 +324,12 @@ pub(crate) enum Message {
     /// chapter via the same fractional snap-back path as a resize, because
     /// the effective viewport width changes by [`TOC_WIDTH`].
     ToggleToc,
+    /// Toggle two-page (facing-pages) spread layout. Triggers a re-paginate
+    /// of the current chapter via the same fractional snap-back path as a
+    /// resize, because the per-slot viewport width changes (full → half or
+    /// vice versa). On entering spread mode the cursor is rounded down to
+    /// an even page so the spread is `(even, even+1)`.
+    ToggleSpread,
     /// Catch-all for keyboard events we want to ignore.
     Ignored,
 }
@@ -352,6 +431,32 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             apply_viewport_change(app);
             Task::none()
         }
+        Message::ToggleSpread => {
+            app.spread_mode = !app.spread_mode;
+            // If we're entering spread mode mid-chapter, snap the cursor
+            // down to the nearest even page so the spread is
+            // `(even, even+1)`. Without this, a user on page 3 toggling
+            // spread would see `(3, 4)` and then `(5, 6)` — fine, but
+            // breaks the invariant that the cursor always sits on a
+            // left-page in spread mode.
+            let mut snapped_from = None;
+            if app.spread_mode
+                && let Some(book) = app.book.as_mut()
+                && book.current_page_in_chapter & 1 == 1
+            {
+                let from = book.current_page_in_chapter;
+                book.current_page_in_chapter &= !1;
+                snapped_from = Some(from);
+                book.cached = None;
+            }
+            tracing::info!(
+                enabled = app.spread_mode,
+                snapped_from = ?snapped_from,
+                "spread mode toggled"
+            );
+            apply_viewport_change(app);
+            Task::none()
+        }
         Message::FontSizeAdjust(delta) => {
             let target = match delta {
                 FontSizeAdjust::Increase => app.theme.base_font_size + FONT_SIZE_STEP,
@@ -387,7 +492,7 @@ fn apply_theme_change(app: &mut App, new_theme: LayoutTheme) {
 /// dance.
 fn repaginate_all_with_snapback(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.effective_viewport();
+    let viewport = app.effective_per_page_viewport();
     let Some(book) = app.book.as_mut() else {
         return;
     };
@@ -503,7 +608,7 @@ fn handle_open(app: &mut App, path: PathBuf) {
         pending_position_fraction: None,
         chapter_titles,
     };
-    let viewport = app.effective_viewport();
+    let viewport = app.effective_per_page_viewport();
     // Always request chapter 0 for the empty-chapter scan; if the user
     // resumed past it, also request the resume chapter so the reader
     // doesn't sit on "paginating…" any longer than necessary.
@@ -588,7 +693,8 @@ fn request_chapter(
 
 fn drain_worker(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.effective_viewport();
+    let viewport = app.effective_per_page_viewport();
+    let spread_active = app.spread_active();
     let Some(book) = app.book.as_mut() else {
         return;
     };
@@ -633,7 +739,15 @@ fn drain_worker(app: &mut App) {
             // Floor-cast: a fraction of 0.99 against an 8-page chapter
             // lands on page 7 (last), which is what the user expects.
             let target = (fraction * pages as f32).floor() as usize;
-            book.current_page_in_chapter = target.min(pages - 1);
+            let mut snapped = target.min(pages - 1);
+            // In spread mode the cursor must point at the *left* page of
+            // the current spread, i.e. an even index. Round down with
+            // bitwise-and; never cross below 0 (already guaranteed by
+            // `usize`).
+            if spread_active {
+                snapped &= !1;
+            }
+            book.current_page_in_chapter = snapped;
         } else {
             book.current_page_in_chapter = 0;
         }
@@ -787,15 +901,16 @@ fn next_chapter_to_prefetch(book: &OpenBook) -> Option<usize> {
 
 fn handle_nav(app: &mut App, cmd: NavCommand) {
     let theme = app.theme.clone();
-    let viewport = app.effective_viewport();
+    let viewport = app.effective_per_page_viewport();
+    let spread_active = app.spread_active();
     let repaginating = app.repaginating;
     let Some(book) = app.book.as_mut() else {
         return;
     };
     let before = (book.current_chapter, book.current_page_in_chapter);
     match cmd {
-        NavCommand::NextPage => nav_next_page(book, viewport, &theme),
-        NavCommand::PrevPage => nav_prev_page(book, &theme),
+        NavCommand::NextPage => nav_next_page(book, viewport, &theme, spread_active),
+        NavCommand::PrevPage => nav_prev_page(book, &theme, spread_active),
         NavCommand::FirstPage => {
             book.current_page_in_chapter = 0;
             book.cached = None;
@@ -804,7 +919,14 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
             if let ChapterState::Loaded(c) = &book.chapters[book.current_chapter]
                 && c.page_count() > 0
             {
-                book.current_page_in_chapter = c.page_count() - 1;
+                let last = c.page_count() - 1;
+                // In spread mode the cursor must point at the *left* page
+                // of the current spread (an even index). For an even
+                // page-count chapter (`last` is odd) this lands on
+                // `(last-1, last)`; for an odd page-count chapter (`last`
+                // is even) it lands on `(last, blank)`. Either way the
+                // last page is visible in the final spread.
+                book.current_page_in_chapter = if spread_active { last & !1 } else { last };
                 book.cached = None;
             }
         }
@@ -843,17 +965,27 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
     }
 }
 
-fn nav_next_page(book: &mut OpenBook, viewport: Viewport, theme: &LayoutTheme) {
+fn nav_next_page(
+    book: &mut OpenBook,
+    viewport: Viewport,
+    theme: &LayoutTheme,
+    spread_active: bool,
+) {
     let total_chapters = book.chapters.len();
     let current_pages = match &book.chapters[book.current_chapter] {
         ChapterState::Loaded(c) => c.page_count(),
         _ => 0,
     };
-    if current_pages > 0 && book.current_page_in_chapter + 1 < current_pages {
-        book.current_page_in_chapter += 1;
+    let step = if spread_active { 2 } else { 1 };
+    if current_pages > 0 && book.current_page_in_chapter + step < current_pages {
+        book.current_page_in_chapter += step;
         book.cached = None;
         return;
     }
+    // In spread mode, an odd-page chapter shows its last page in the left
+    // slot with the right slot blank — and `current_page_in_chapter` is
+    // even-aligned, so the `+ step < current_pages` guard above already
+    // covers it (advancing would cross the chapter boundary).
     // Roll into next non-empty chapter.
     let mut idx = book.current_chapter + 1;
     while idx < total_chapters {
@@ -884,9 +1016,10 @@ fn nav_next_page(book: &mut OpenBook, viewport: Viewport, theme: &LayoutTheme) {
     }
 }
 
-fn nav_prev_page(book: &mut OpenBook, _theme: &LayoutTheme) {
-    if book.current_page_in_chapter > 0 {
-        book.current_page_in_chapter -= 1;
+fn nav_prev_page(book: &mut OpenBook, _theme: &LayoutTheme, spread_active: bool) {
+    let step = if spread_active { 2 } else { 1 };
+    if book.current_page_in_chapter >= step {
+        book.current_page_in_chapter -= step;
         book.cached = None;
         return;
     }
@@ -900,7 +1033,10 @@ fn nav_prev_page(book: &mut OpenBook, _theme: &LayoutTheme) {
         match &book.chapters[idx] {
             ChapterState::Loaded(c) if c.page_count() > 0 => {
                 book.current_chapter = idx;
-                book.current_page_in_chapter = c.page_count() - 1;
+                let last = c.page_count() - 1;
+                // Land on the *left* page of the final spread so the user
+                // sees the chapter's tail spread (not its lone right page).
+                book.current_page_in_chapter = if spread_active { last & !1 } else { last };
                 book.cached = None;
                 return;
             }
@@ -923,6 +1059,7 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         );
     };
 
+    let spread_active = app.spread_active();
     let chapter_state = &book.chapters[book.current_chapter];
     let pane: iced::Element<'_, Message> = match chapter_state {
         ChapterState::Pending | ChapterState::NotRequested => reader::pane_message("paginating…"),
@@ -939,15 +1076,26 @@ fn view(app: &App) -> iced::Element<'_, Message> {
                 let cached = book.cached.as_ref().filter(|c| {
                     c.chapter_index == book.current_chapter
                         && c.page_in_chapter == book.current_page_in_chapter
+                        && c.spread == spread_active
                 });
-                let handle = match cached {
+                let left_handle = match cached {
                     Some(c) => c.handle.clone(),
                     None => {
-                        let blank = blank_image(app.effective_viewport(), app.theme.bg_color);
+                        let blank =
+                            blank_image(app.effective_per_page_viewport(), app.theme.bg_color);
                         Handle::from_rgba(blank.width, blank.height, blank.pixels)
                     }
                 };
-                reader::pane_image(handle)
+                if spread_active {
+                    // Right slot: rasterized page N+1 if it exists in this
+                    // chapter, otherwise a blank slot of equal width — the
+                    // odd-final-page case. Never spill into the next
+                    // chapter.
+                    let right_handle = cached.and_then(|c| c.right_handle.clone());
+                    reader::pane_spread(left_handle, right_handle, SPREAD_GUTTER)
+                } else {
+                    reader::pane_image(left_handle)
+                }
             }
         }
     };
@@ -969,6 +1117,7 @@ fn view(app: &App) -> iced::Element<'_, Message> {
         app.theme.is_dark(),
         app.theme.base_font_size,
         app.toc_open,
+        app.spread_mode,
     )
 }
 
@@ -992,8 +1141,27 @@ fn blank_image(viewport: Viewport, bg: cosmic_text::Color) -> PageImage {
 /// Called from `update` (where `&mut App` is available) before view runs.
 fn ensure_cache(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.effective_viewport();
+    let viewport = app.effective_per_page_viewport();
     let render_scale = app.render_scale;
+    let spread_active = app.spread_active();
+    // Log once on entering / leaving the auto-fallback (i.e. spread is
+    // requested but the per-slot width is too narrow). Avoids per-frame
+    // log spam during a drag-resize.
+    let fallback_now = app.spread_mode && !spread_active;
+    if fallback_now != app.spread_fallback_active {
+        if fallback_now {
+            tracing::debug!(
+                width = app.effective_viewport().width,
+                "spread mode auto-fallback: window too narrow, rendering single page"
+            );
+        } else if app.spread_mode {
+            tracing::debug!(
+                width = app.effective_viewport().width,
+                "spread mode auto-fallback ended: rendering facing pages"
+            );
+        }
+        app.spread_fallback_active = fallback_now;
+    }
     if app.book.is_none() {
         return;
     }
@@ -1003,6 +1171,7 @@ fn ensure_cache(app: &mut App) {
             Some(c) => {
                 c.chapter_index != book.current_chapter
                     || c.page_in_chapter != book.current_page_in_chapter
+                    || c.spread != spread_active
             }
             None => true,
         },
@@ -1035,14 +1204,36 @@ fn ensure_cache(app: &mut App) {
         &mut app.font_system,
         &mut app.swash_cache,
     );
+    let handle = Handle::from_rgba(image.width, image.height, image.pixels);
+
+    // In spread mode, also rasterize the right-slot page if it exists.
+    let right_handle = if spread_active {
+        let right_index = page_index + 1;
+        chapter.page(right_index).map(|right_page| {
+            let right_image = render::render_page(
+                right_page,
+                &chapter,
+                viewport,
+                &theme,
+                render_scale,
+                &mut app.font_system,
+                &mut app.swash_cache,
+            );
+            Handle::from_rgba(right_image.width, right_image.height, right_image.pixels)
+        })
+    } else {
+        None
+    };
+
     if let Some(book) = app.book.as_mut() {
         // Build the Handle once at rasterization time so its internal id
         // is stable across all subsequent `view()` calls for this page.
-        let handle = Handle::from_rgba(image.width, image.height, image.pixels);
         book.cached = Some(CachedPage {
             chapter_index,
             page_in_chapter: page_index,
             handle,
+            right_handle,
+            spread: spread_active,
         });
     }
 }
@@ -1128,6 +1319,9 @@ fn map_character_key(s: &str) -> Message {
         // the raw event stream still leaves iced's handler running, which
         // would shift focus on every toggle. `o` has no such collision.
         "o" | "O" => Message::ToggleToc,
+        // `s` for "spread" / facing-pages. Verified non-colliding with the
+        // existing nav + theme + font + TOC bindings.
+        "s" | "S" => Message::ToggleSpread,
         "+" | "=" => Message::FontSizeAdjust(FontSizeAdjust::Increase),
         "-" | "_" => Message::FontSizeAdjust(FontSizeAdjust::Decrease),
         "0" => Message::FontSizeAdjust(FontSizeAdjust::Reset),

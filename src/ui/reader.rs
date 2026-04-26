@@ -32,6 +32,7 @@ pub(crate) fn view<'a>(
     is_dark: bool,
     font_size: f32,
     toc_open: bool,
+    spread_mode: bool,
 ) -> Element<'a, Message> {
     let pane_container = container(pane).center_x(Fill).center_y(Fill);
 
@@ -40,7 +41,8 @@ pub(crate) fn view<'a>(
         None => pane_container.height(Fill).width(Fill).into(),
     };
 
-    let mut tree: Column<'_, Message> = column![toolbar(is_dark, font_size, toc_open), body];
+    let mut tree: Column<'_, Message> =
+        column![toolbar(is_dark, font_size, toc_open, spread_mode), body];
     if let Some(msg) = status {
         tree = tree.push(
             container(text(msg).size(12))
@@ -62,6 +64,37 @@ pub(crate) fn pane_image(handle: Handle) -> Element<'static, Message> {
         .into()
 }
 
+/// Reader-pane content for two-page (facing-pages) spread layout.
+///
+/// Renders `left` and `right` images side by side, separated by a `gutter`-
+/// wide blank space. When `right` is `None` (odd-final-page case) the right
+/// slot is filled with an equally-sized blank `Space` so the left page
+/// stays positioned exactly where the user expects — never spilling into
+/// the next chapter's first page.
+pub(crate) fn pane_spread(
+    left: Handle,
+    right: Option<Handle>,
+    gutter: f32,
+) -> Element<'static, Message> {
+    let left_el: Element<'static, Message> = image(left)
+        .content_fit(iced::ContentFit::Contain)
+        .width(Fill)
+        .height(Fill)
+        .into();
+    let right_el: Element<'static, Message> = match right {
+        Some(handle) => image(handle)
+            .content_fit(iced::ContentFit::Contain)
+            .width(Fill)
+            .height(Fill)
+            .into(),
+        None => Space::new().width(Fill).height(Fill).into(),
+    };
+    row![left_el, Space::new().width(Length::Fixed(gutter)), right_el]
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
 /// Reader-pane content for transient/non-actionable states (errors,
 /// "paginating…", "(no page)"). Plain centered text — no buttons, since
 /// the user has nothing useful to do besides read the message.
@@ -78,7 +111,12 @@ pub(crate) fn pane_message(message: &str) -> Element<'_, Message> {
 /// dark, prefixed with the matching glyph); font controls on the right
 /// present `A-` / current size / `A+`, plus an `A` reset. The TOC toggle
 /// sits between the theme button and the spacer.
-fn toolbar(is_dark: bool, font_size: f32, toc_open: bool) -> Element<'static, Message> {
+fn toolbar(
+    is_dark: bool,
+    font_size: f32,
+    toc_open: bool,
+    spread_mode: bool,
+) -> Element<'static, Message> {
     let theme_label = if is_dark {
         // Currently dark → clicking switches to light.
         "\u{2600} Light"
@@ -96,6 +134,17 @@ fn toolbar(is_dark: bool, font_size: f32, toc_open: bool) -> Element<'static, Me
     };
     let toc_button = button(text(toc_label).size(13))
         .on_press(Message::ToggleToc)
+        .padding([4, 10]);
+
+    // Show the *target* state, matching the theme button convention: we
+    // display what clicking will switch *to*, not the current mode.
+    let spread_label = if spread_mode {
+        "\u{25A4} Single"
+    } else {
+        "\u{25A5} Spread"
+    };
+    let spread_button = button(text(spread_label).size(13))
+        .on_press(Message::ToggleSpread)
         .padding([4, 10]);
 
     let font_controls: Row<'_, Message> = row![
@@ -116,6 +165,7 @@ fn toolbar(is_dark: bool, font_size: f32, toc_open: bool) -> Element<'static, Me
     let bar: Row<'_, Message> = row![
         theme_button,
         toc_button,
+        spread_button,
         Space::new().width(Fill),
         font_controls,
     ]
