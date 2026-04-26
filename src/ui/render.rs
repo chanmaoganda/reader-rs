@@ -89,11 +89,15 @@ pub(crate) fn render_page(
             let block_top = *block_top.get_or_insert(run.line_top);
             let line_top_within_slice = run.line_top - block_top;
             // Baseline-to-top distance for this line — still in the layout's
-            // logical units; cosmic-text's `physical(..., scale)` multiplies
-            // it through to physical pixel coordinates.
-            let baseline_y =
+            // logical units. cosmic-text's `LayoutGlyph::physical(offset,
+            // scale)` only scales the glyph's intra-line coordinates and
+            // *adds* `offset` unscaled, so any logical-pixel quantities we
+            // contribute (page margin, slice anchor, baseline shift) must be
+            // pre-multiplied by `scale` before being passed in.
+            let baseline_y_logical =
                 margin + slice.y_offset + (run.line_y - run.line_top) + line_top_within_slice;
-            let pen_x = margin;
+            let baseline_y = baseline_y_logical * scale;
+            let pen_x = margin * scale;
 
             for glyph in run.glyphs {
                 let physical = glyph.physical((pen_x, baseline_y), scale);
@@ -326,5 +330,90 @@ mod tests {
             .chunks_exact(4)
             .any(|c| c[0] != bg.0 || c[1] != bg.1 || c[2] != bg.2);
         assert!(any_fg, "CJK page should contain non-bg pixels");
+    }
+
+    /// Regression for the HiDPI compaction bug: with `scale = 2.0`,
+    /// `LayoutGlyph::physical(offset, scale)` only scales the glyph's
+    /// intra-line coordinates — it adds the `offset` unscaled. So we must
+    /// pre-multiply the page margin / baseline by `scale` ourselves.
+    /// Without that pre-multiply, glyph positions stay near the top-left
+    /// while the glyphs themselves are 2x bigger and overlap ("compacted").
+    ///
+    /// This test asserts:
+    /// 1. the output buffer is `2 *` the viewport in each dimension at
+    ///    `scale = 2.0`, and
+    /// 2. the first non-background pixel from the left on the first text
+    ///    row is roughly twice as far right at `scale = 2.0` as at
+    ///    `scale = 1.0` — i.e. the page margin scaled.
+    #[test]
+    fn scale_doubles_glyph_offsets() {
+        let mut fs = LayoutFontSystem::new();
+        let mut cache = SwashCache::new();
+        let theme = Theme::dark();
+        let viewport = Viewport {
+            width: 400.0,
+            height: 600.0,
+        };
+        let chapter = fixture_chapter(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>One.</p><p>Two.</p><p>Three.</p></body></html>"#,
+        );
+        let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
+        let page = out.page(0).expect("page 0");
+
+        let img1 = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);
+        let img2 = render_page(page, &out, viewport, &theme, 2.0, &mut fs, &mut cache);
+
+        // (1) Buffer dimensions track scale.
+        assert_eq!(img1.width, 400);
+        assert_eq!(img1.height, 600);
+        assert_eq!(img2.width, 800);
+        assert_eq!(img2.height, 1200);
+
+        let bg = theme.bg_color.as_rgba_tuple();
+
+        // Helper: leftmost non-bg x on the first row that has any text.
+        fn first_text_left(img: &PageImage, bg: (u8, u8, u8, u8)) -> Option<(u32, u32)> {
+            let w = img.width as usize;
+            let h = img.height as usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    let c = &img.pixels[i..i + 4];
+                    if c[0] != bg.0 || c[1] != bg.1 || c[2] != bg.2 {
+                        return Some((x as u32, y as u32));
+                    }
+                }
+            }
+            None
+        }
+
+        let (x1, _y1) = first_text_left(&img1, bg).expect("scale=1 has text");
+        let (x2, _y2) = first_text_left(&img2, bg).expect("scale=2 has text");
+
+        // (2) Left margin should roughly double. Allow ±2 px slack for
+        // sub-pixel/hinting differences in glyph mask placement.
+        let expected = 2 * x1;
+        assert!(
+            x2 >= expected.saturating_sub(2) && x2 <= expected + 2,
+            "expected first-text x at scale=2 ({x2}) to be ~2x scale=1 ({x1}); \
+             with the bug present it would be ~{x1} (glyphs grow but offset doesn't)"
+        );
+
+        // Sanity: scale=2 should have noticeably MORE non-bg pixels than
+        // scale=1 (4x the area covered by ~4x as many glyph pixels).
+        let count_nb = |img: &PageImage| {
+            img.pixels
+                .chunks_exact(4)
+                .filter(|c| c[0] != bg.0 || c[1] != bg.1 || c[2] != bg.2)
+                .count()
+        };
+        let n1 = count_nb(&img1);
+        let n2 = count_nb(&img2);
+        assert!(
+            n2 > n1 * 2,
+            "scale=2 should cover substantially more pixels than scale=1: \
+             n1={n1}, n2={n2}"
+        );
     }
 }
