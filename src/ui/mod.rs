@@ -88,6 +88,13 @@ const DEFAULT_FONT_SIZE: f32 = 16.0;
 /// Step (in px) applied by `+` / `-` hotkeys and the `A-` / `A+` buttons.
 const FONT_SIZE_STEP: f32 = 1.0;
 
+/// Width of the TOC sidebar in logical px when it is open. The reader's
+/// effective viewport (`App::effective_viewport`) shrinks by this amount,
+/// which routes through the existing paginate path so opening/closing the
+/// TOC re-flows the current chapter and the snap-back logic preserves the
+/// cursor's fractional position.
+const TOC_WIDTH: f32 = 280.0;
+
 /// Per-chapter state on the UI side.
 enum ChapterState {
     NotRequested,
@@ -112,6 +119,10 @@ struct OpenBook {
     /// the new pagination to the same logical place. `None` means no
     /// repagination is in flight (or the cursor was already at page 0).
     pending_position_fraction: Option<f32>,
+    /// Per-chapter display titles for the TOC sidebar. Captured at open
+    /// time from `BookSource::spine()` because the worker takes ownership
+    /// of the source. `None` entries fall back to "Chapter N" at render.
+    chapter_titles: Vec<Option<String>>,
 }
 
 struct CachedPage {
@@ -154,6 +165,10 @@ struct App {
     /// [`persist_progress`] so we don't write a stale `(chapter, page)`
     /// pair against the new page-count.
     repaginating: bool,
+    /// `true` when the TOC sidebar is visible. Toggled by [`Message::ToggleToc`]
+    /// (hotkey `O` or the toolbar button); shrinks the effective viewport by
+    /// [`TOC_WIDTH`] which routes through the existing re-paginate path.
+    toc_open: bool,
 }
 
 impl App {
@@ -174,6 +189,22 @@ impl App {
             render_scale: DEFAULT_RENDER_SCALE,
             pending_resize: None,
             repaginating: false,
+            toc_open: false,
+        }
+    }
+
+    /// Logical viewport actually available to the reader pane. Subtracts
+    /// the TOC sidebar width when [`App::toc_open`] is true; clamped to a
+    /// floor of [`MIN_VIEWPORT_DIM`] so opening the TOC on a narrow window
+    /// can never produce a non-positive paginate width.
+    fn effective_viewport(&self) -> Viewport {
+        if self.toc_open {
+            Viewport {
+                width: (self.viewport.width - TOC_WIDTH).max(MIN_VIEWPORT_DIM),
+                height: self.viewport.height,
+            }
+        } else {
+            self.viewport
         }
     }
 }
@@ -216,6 +247,10 @@ pub(crate) enum Message {
     /// [`Message::FontSizeChanged`] with the resulting absolute size.
     /// Carrying a delta keeps `map_key` free of `App` references.
     FontSizeAdjust(FontSizeAdjust),
+    /// Show or hide the TOC sidebar. Triggers a re-paginate of the current
+    /// chapter via the same fractional snap-back path as a resize, because
+    /// the effective viewport width changes by [`TOC_WIDTH`].
+    ToggleToc,
     /// Catch-all for keyboard events we want to ignore.
     Ignored,
 }
@@ -240,6 +275,10 @@ pub(crate) enum NavCommand {
     LastPage,
     NextChapter,
     PrevChapter,
+    /// Jump to a specific chapter (and its first page). Sent by the TOC
+    /// sidebar when the user clicks an entry. Out-of-range indices are
+    /// silently ignored in [`handle_nav`].
+    JumpToChapter(usize),
 }
 
 fn boot(initial_path: Option<PathBuf>) -> (App, Task<Message>) {
@@ -307,6 +346,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             apply_theme_change(app, next);
             Task::none()
         }
+        Message::ToggleToc => {
+            app.toc_open = !app.toc_open;
+            tracing::info!(open = app.toc_open, "toc toggled");
+            apply_viewport_change(app);
+            Task::none()
+        }
         Message::FontSizeAdjust(delta) => {
             let target = match delta {
                 FontSizeAdjust::Increase => app.theme.base_font_size + FONT_SIZE_STEP,
@@ -330,8 +375,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// [`drain_worker`] re-requests adjacent chapters as needed.
 fn apply_theme_change(app: &mut App, new_theme: LayoutTheme) {
     app.theme = new_theme;
+    repaginate_all_with_snapback(app);
+}
+
+/// Drop every cached pagination, capture the cursor's fractional position
+/// so it can be restored after the current chapter comes back from the
+/// worker, and request the current chapter at the live (theme, viewport).
+///
+/// Shared by [`apply_theme_change`] and [`apply_viewport_change`] — both
+/// invalidate every page boundary in the book and follow the same recovery
+/// dance.
+fn repaginate_all_with_snapback(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.viewport;
+    let viewport = app.effective_viewport();
     let Some(book) = app.book.as_mut() else {
         return;
     };
@@ -351,6 +407,13 @@ fn apply_theme_change(app: &mut App, new_theme: LayoutTheme) {
     book.cached = None;
     request_chapter(book, current_index, viewport, &theme);
     app.repaginating = true;
+}
+
+/// Re-paginate the current chapter because the effective viewport changed
+/// (TOC opened/closed). Page boundaries depend on the viewport width, so
+/// every cached chapter is now stale.
+fn apply_viewport_change(app: &mut App) {
+    repaginate_all_with_snapback(app);
 }
 
 /// Pop the native "Open file…" dialog and, on selection, hand the chosen
@@ -385,6 +448,21 @@ fn handle_open(app: &mut App, path: PathBuf) {
         app.error = Some("book has no chapters".to_owned());
         return;
     }
+    // Snapshot spine titles before handing the book off to the worker — the
+    // worker takes ownership of the BookSource, so this is the UI thread's
+    // last chance to read it. Empty strings collapse to None so the
+    // "Chapter N" fallback fires consistently.
+    let chapter_titles: Vec<Option<String>> = book
+        .spine()
+        .iter()
+        .map(|c| {
+            c.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
     tracing::info!(path = %path.display(), chapters = spine_len, "opened book");
     // Open succeeded past every fallible gate — clear any stale error left
     // over from a previous failed open so the new book actually renders.
@@ -423,13 +501,15 @@ fn handle_open(app: &mut App, path: PathBuf) {
         cached: None,
         persistence_key,
         pending_position_fraction: None,
+        chapter_titles,
     };
+    let viewport = app.effective_viewport();
     // Always request chapter 0 for the empty-chapter scan; if the user
     // resumed past it, also request the resume chapter so the reader
     // doesn't sit on "paginating…" any longer than necessary.
-    request_chapter(&mut open, 0, app.viewport, &app.theme);
+    request_chapter(&mut open, 0, viewport, &app.theme);
     if start_chapter != 0 {
-        request_chapter(&mut open, start_chapter, app.viewport, &app.theme);
+        request_chapter(&mut open, start_chapter, viewport, &app.theme);
     }
     app.book = Some(open);
     app.status = Some(format!("opened: {}", path.display()));
@@ -508,7 +588,7 @@ fn request_chapter(
 
 fn drain_worker(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.viewport;
+    let viewport = app.effective_viewport();
     let Some(book) = app.book.as_mut() else {
         return;
     };
@@ -659,33 +739,7 @@ fn commit_pending_resize(app: &mut App) {
         "viewport resized; re-paginating"
     );
     app.viewport = new_viewport;
-
-    let theme = app.theme.clone();
-    let viewport = app.viewport;
-    let Some(book) = app.book.as_mut() else {
-        return;
-    };
-
-    // Capture position-within-current-chapter as a fraction so we can land
-    // on roughly the same logical place after re-pagination.
-    let current_index = book.current_chapter;
-    let fraction = match book.chapters.get(current_index) {
-        Some(ChapterState::Loaded(c)) if c.page_count() > 0 => {
-            Some(book.current_page_in_chapter as f32 / c.page_count() as f32)
-        }
-        _ => None,
-    };
-    book.pending_position_fraction = fraction;
-
-    // Drop every pagination — page boundaries depend on the viewport, so
-    // every cached chapter is now stale. The next-chapter prefetch path in
-    // `drain_worker` will re-request adjacent chapters as needed.
-    for state in book.chapters.iter_mut() {
-        *state = ChapterState::NotRequested;
-    }
-    book.cached = None;
-    request_chapter(book, current_index, viewport, &theme);
-    app.repaginating = true;
+    repaginate_all_with_snapback(app);
 }
 
 /// Update the live render scale and invalidate the rasterized cache.
@@ -733,7 +787,7 @@ fn next_chapter_to_prefetch(book: &OpenBook) -> Option<usize> {
 
 fn handle_nav(app: &mut App, cmd: NavCommand) {
     let theme = app.theme.clone();
-    let viewport = app.viewport;
+    let viewport = app.effective_viewport();
     let repaginating = app.repaginating;
     let Some(book) = app.book.as_mut() else {
         return;
@@ -768,6 +822,15 @@ fn handle_nav(app: &mut App, cmd: NavCommand) {
                 book.current_chapter -= 1;
                 book.current_page_in_chapter = 0;
                 book.cached = None;
+            }
+        }
+        NavCommand::JumpToChapter(idx) => {
+            if idx < book.chapters.len() && idx != book.current_chapter {
+                tracing::info!(from = book.current_chapter, to = idx, "toc jump to chapter");
+                book.current_chapter = idx;
+                book.current_page_in_chapter = 0;
+                book.cached = None;
+                request_chapter(book, idx, viewport, &theme);
             }
         }
     }
@@ -861,43 +924,51 @@ fn view(app: &App) -> iced::Element<'_, Message> {
     };
 
     let chapter_state = &book.chapters[book.current_chapter];
-    let chapter = match chapter_state {
-        ChapterState::Loaded(c) => c,
-        ChapterState::Pending | ChapterState::NotRequested => {
-            return reader::empty_view("paginating…");
-        }
-        ChapterState::Failed(_) => {
-            return reader::empty_view("chapter failed to paginate");
+    let pane: iced::Element<'_, Message> = match chapter_state {
+        ChapterState::Pending | ChapterState::NotRequested => reader::pane_message("paginating…"),
+        ChapterState::Failed(_) => reader::pane_message("chapter failed to paginate"),
+        ChapterState::Loaded(chapter) => {
+            if chapter.page(book.current_page_in_chapter).is_none() {
+                reader::pane_message("(no page)")
+            } else {
+                // Rasterization happens in `ensure_cache` from
+                // `update_with_cache`. `view` is called every frame; we MUST
+                // return the same `Handle` (with the same internal id) when
+                // the page hasn't changed, otherwise iced re-uploads the
+                // texture and the picture flickers.
+                let cached = book.cached.as_ref().filter(|c| {
+                    c.chapter_index == book.current_chapter
+                        && c.page_in_chapter == book.current_page_in_chapter
+                });
+                let handle = match cached {
+                    Some(c) => c.handle.clone(),
+                    None => {
+                        let blank = blank_image(app.effective_viewport(), app.theme.bg_color);
+                        Handle::from_rgba(blank.width, blank.height, blank.pixels)
+                    }
+                };
+                reader::pane_image(handle)
+            }
         }
     };
-    if chapter.page(book.current_page_in_chapter).is_none() {
-        return reader::empty_view("(no page)");
-    }
 
-    // Rasterization happens in `ensure_cache` from `update_with_cache`.
-    // `view` is called every frame; we MUST return the same `Handle` (with
-    // the same internal id) when the page hasn't changed, otherwise iced
-    // re-uploads the texture and the picture flickers.
-    let cached = book.cached.as_ref().filter(|c| {
-        c.chapter_index == book.current_chapter && c.page_in_chapter == book.current_page_in_chapter
-    });
-    let handle = match cached {
-        // Handle is internally `Arc`-shared; cloning is cheap and preserves the id.
-        Some(c) => c.handle.clone(),
-        None => {
-            // No cache yet — paint a flat background. `ensure_cache` runs
-            // from `update_with_cache` before view, so this path only fires
-            // on the very first frame after open / on missing chapter data.
-            let blank = blank_image(app.viewport, app.theme.bg_color);
-            Handle::from_rgba(blank.width, blank.height, blank.pixels)
-        }
+    let toc: Option<iced::Element<'_, Message>> = if app.toc_open {
+        Some(reader::toc_view(
+            &book.chapter_titles,
+            book.current_chapter,
+            TOC_WIDTH,
+        ))
+    } else {
+        None
     };
 
     reader::view(
-        handle,
+        pane,
+        toc,
         app.status.as_deref(),
         app.theme.is_dark(),
         app.theme.base_font_size,
+        app.toc_open,
     )
 }
 
@@ -921,7 +992,7 @@ fn blank_image(viewport: Viewport, bg: cosmic_text::Color) -> PageImage {
 /// Called from `update` (where `&mut App` is available) before view runs.
 fn ensure_cache(app: &mut App) {
     let theme = app.theme.clone();
-    let viewport = app.viewport;
+    let viewport = app.effective_viewport();
     let render_scale = app.render_scale;
     if app.book.is_none() {
         return;
@@ -1052,6 +1123,11 @@ fn map_character_key(s: &str) -> Message {
     // layouts; accept both so the user doesn't need to hold shift.
     match s {
         "t" | "T" => Message::ToggleTheme,
+        // `o` for "outline". `Tab` would be the natural choice but iced 0.14
+        // already binds Tab for widget focus traversal; intercepting it from
+        // the raw event stream still leaves iced's handler running, which
+        // would shift focus on every toggle. `o` has no such collision.
+        "o" | "O" => Message::ToggleToc,
         "+" | "=" => Message::FontSizeAdjust(FontSizeAdjust::Increase),
         "-" | "_" => Message::FontSizeAdjust(FontSizeAdjust::Decrease),
         "0" => Message::FontSizeAdjust(FontSizeAdjust::Reset),

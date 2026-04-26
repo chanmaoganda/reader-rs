@@ -6,13 +6,13 @@
 //! widget tree.
 
 use iced::widget::image::Handle;
-use iced::widget::{Column, Row, Space, button, column, container, image, row, text};
-use iced::{Center, Element, Fill};
+use iced::widget::{Column, Row, Space, button, column, container, image, row, scrollable, text};
+use iced::{Center, Element, Fill, Length};
 
-use super::{FontSizeAdjust, Message};
+use super::{FontSizeAdjust, Message, NavCommand};
 
-/// Build the reader-view tree for a page that has already been rasterized
-/// into `handle`.
+/// Build the full reader-view tree: toolbar on top, then a horizontal row
+/// containing the optional TOC sidebar and the reader pane.
 ///
 /// The rasterized texture is rendered at the live HiDPI scale tracked on
 /// `App` (see `super::handle_rescaled`); we ask iced to expand the image
@@ -20,24 +20,27 @@ use super::{FontSizeAdjust, Message};
 /// the high-res source maps to physical pixels with as little resampling
 /// as possible.
 ///
-/// `is_dark` and `font_size` drive the chrome toolbar above the page so
-/// the labels reflect the live theme; both come from
-/// [`super::App::theme`].
-pub(crate) fn view(
-    handle: Handle,
-    status: Option<&str>,
+/// `pane` is the inner reader element (image, "paginating…", error, etc.)
+/// produced by [`pane_image`] / [`pane_message`]. `toc` is `Some` when the
+/// TOC sidebar is open. `is_dark` and `font_size` drive the toolbar; both
+/// come from [`super::App::theme`]. `toc_open` is reflected in the toolbar
+/// "TOC" button's label so the user sees the current state.
+pub(crate) fn view<'a>(
+    pane: Element<'a, Message>,
+    toc: Option<Element<'a, Message>>,
+    status: Option<&'a str>,
     is_dark: bool,
     font_size: f32,
-) -> Element<'_, Message> {
-    let img = image(handle)
-        .content_fit(iced::ContentFit::Contain)
-        .width(Fill)
-        .height(Fill);
+    toc_open: bool,
+) -> Element<'a, Message> {
+    let pane_container = container(pane).center_x(Fill).center_y(Fill);
 
-    let mut tree: Column<'_, Message> = column![
-        toolbar(is_dark, font_size),
-        container(img).center_x(Fill).center_y(Fill),
-    ];
+    let body: Element<'a, Message> = match toc {
+        Some(toc) => row![toc, pane_container].height(Fill).width(Fill).into(),
+        None => pane_container.height(Fill).width(Fill).into(),
+    };
+
+    let mut tree: Column<'_, Message> = column![toolbar(is_dark, font_size, toc_open), body];
     if let Some(msg) = status {
         tree = tree.push(
             container(text(msg).size(12))
@@ -50,12 +53,32 @@ pub(crate) fn view(
     container(tree).center_x(Fill).center_y(Fill).into()
 }
 
+/// Reader-pane content for a successfully-rasterized page.
+pub(crate) fn pane_image(handle: Handle) -> Element<'static, Message> {
+    image(handle)
+        .content_fit(iced::ContentFit::Contain)
+        .width(Fill)
+        .height(Fill)
+        .into()
+}
+
+/// Reader-pane content for transient/non-actionable states (errors,
+/// "paginating…", "(no page)"). Plain centered text — no buttons, since
+/// the user has nothing useful to do besides read the message.
+pub(crate) fn pane_message(message: &str) -> Element<'_, Message> {
+    container(text(message).size(20))
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+}
+
 /// One toolbar row, kept short (≤32 px) so it doesn't eat reading area.
 ///
 /// Theme button on the left shows the *target* state (e.g. "Light" while
 /// dark, prefixed with the matching glyph); font controls on the right
-/// present `A-` / current size / `A+`, plus an `A` reset.
-fn toolbar(is_dark: bool, font_size: f32) -> Element<'static, Message> {
+/// present `A-` / current size / `A+`, plus an `A` reset. The TOC toggle
+/// sits between the theme button and the spacer.
+fn toolbar(is_dark: bool, font_size: f32, toc_open: bool) -> Element<'static, Message> {
     let theme_label = if is_dark {
         // Currently dark → clicking switches to light.
         "\u{2600} Light"
@@ -64,6 +87,15 @@ fn toolbar(is_dark: bool, font_size: f32) -> Element<'static, Message> {
     };
     let theme_button = button(text(theme_label).size(13))
         .on_press(Message::ToggleTheme)
+        .padding([4, 10]);
+
+    let toc_label = if toc_open {
+        "TOC \u{25C0}"
+    } else {
+        "TOC \u{25B6}"
+    };
+    let toc_button = button(text(toc_label).size(13))
+        .on_press(Message::ToggleToc)
         .padding([4, 10]);
 
     let font_controls: Row<'_, Message> = row![
@@ -81,9 +113,14 @@ fn toolbar(is_dark: bool, font_size: f32) -> Element<'static, Message> {
     .spacing(6)
     .align_y(Center);
 
-    let bar: Row<'_, Message> = row![theme_button, Space::new().width(Fill), font_controls,]
-        .align_y(Center)
-        .spacing(8);
+    let bar: Row<'_, Message> = row![
+        theme_button,
+        toc_button,
+        Space::new().width(Fill),
+        font_controls,
+    ]
+    .align_y(Center)
+    .spacing(8);
 
     container(bar).padding([4, 12]).width(Fill).into()
 }
@@ -116,4 +153,42 @@ pub(crate) fn splash_view(message: &str, on_open: Message) -> Element<'_, Messag
     .align_x(Center);
 
     container(body).center_x(Fill).center_y(Fill).into()
+}
+
+/// Build the TOC sidebar. Each entry is a left-aligned button row whose
+/// label is the chapter title or the `"Chapter N"` fallback when the title
+/// is missing or empty.
+///
+/// `current` highlights the active chapter via `button::primary`; other
+/// rows use `button::text` so the sidebar reads as a list, not a grid of
+/// raised buttons. The whole list is wrapped in a [`scrollable`] so books
+/// with hundreds of chapters remain navigable.
+pub(crate) fn toc_view<'a>(
+    titles: &'a [Option<String>],
+    current: usize,
+    width: f32,
+) -> Element<'a, Message> {
+    let mut list: Column<'_, Message> = column![].spacing(2).padding(8).width(Length::Fill);
+    for (idx, title) in titles.iter().enumerate() {
+        let label = match title {
+            Some(t) => t.clone(),
+            None => format!("Chapter {}", idx + 1),
+        };
+        let entry = button(text(label).size(13))
+            .on_press(Message::Nav(NavCommand::JumpToChapter(idx)))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(if idx == current {
+                iced::widget::button::primary
+            } else {
+                iced::widget::button::text
+            });
+        list = list.push(entry);
+    }
+
+    container(scrollable(list).height(Fill).width(Fill))
+        .width(Length::Fixed(width))
+        .height(Fill)
+        .padding(4)
+        .into()
 }
