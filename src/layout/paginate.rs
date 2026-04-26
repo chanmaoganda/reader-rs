@@ -1,15 +1,30 @@
-//! Styled-tree → cosmic-text Buffers → pages.
+//! Styled-tree → cosmic-text Buffers / decoded images → pages.
+
+use std::sync::Arc;
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, Weight};
 
 use super::parse::{Block, parse_chapter};
 use super::style::TextAlign;
-use super::{BlockBuffer, BlockSlice, LaidOutChapter, Page, Theme, Viewport};
-use crate::error::{Error, Result};
-use crate::format::ChapterContent;
+use super::{
+    BlockBuffer, BlockSlice, ImageBuffer, LaidOutChapter, Page, ParagraphBuffer, Theme, Viewport,
+};
+use crate::error::Result;
+use crate::format::{BookSource, ChapterContent};
+
+/// Default placeholder size (logical px) used when an image fails to
+/// resolve or decode. Matches the brief's "small fixed size".
+const PLACEHOLDER_W: f32 = 200.0;
+const PLACEHOLDER_H: f32 = 100.0;
+
+/// Vertical breathing room (logical px) above and below image blocks.
+/// Matches the typical user-agent margin around `<figure>` content; small
+/// enough to keep tightly packed image-heavy chapters legible.
+const IMAGE_MARGIN: f32 = 8.0;
 
 /// Top-level entry point. See [`super::paginate`] for the public docs.
 pub(crate) fn paginate(
+    book: &mut dyn BookSource,
     chapter: &ChapterContent,
     viewport: Viewport,
     theme: &Theme,
@@ -21,7 +36,7 @@ pub(crate) fn paginate(
         theme.base_font_size,
         theme.line_height,
     )
-    .map_err(|err| Error::LayoutParse {
+    .map_err(|err| crate::error::Error::LayoutParse {
         message: err.to_string(),
     })?;
 
@@ -30,7 +45,30 @@ pub(crate) fn paginate(
 
     let mut blocks: Vec<BlockBuffer> = Vec::with_capacity(parsed.blocks.len());
     for block in &parsed.blocks {
-        blocks.push(shape_block(block, inner_width, font_system));
+        match block {
+            Block::Paragraph {
+                style,
+                runs,
+                indent_left,
+            } => {
+                blocks.push(BlockBuffer::Paragraph(shape_paragraph(
+                    style,
+                    runs,
+                    *indent_left,
+                    inner_width,
+                    font_system,
+                )));
+            }
+            Block::Image { src } => {
+                blocks.push(BlockBuffer::Image(resolve_image(
+                    src,
+                    &chapter.base_path,
+                    book,
+                    inner_width,
+                    inner_height,
+                )));
+            }
+        }
     }
 
     let pages = pack_pages(&blocks, inner_height);
@@ -38,52 +76,59 @@ pub(crate) fn paginate(
     Ok(LaidOutChapter { blocks, pages })
 }
 
-fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> BlockBuffer {
-    let mut metrics = Metrics::new(block.style.font_size_px, block.style.line_height_px);
+fn shape_paragraph(
+    style: &super::style::ComputedStyle,
+    runs: &[super::parse::InlineRun],
+    indent_left: f32,
+    width: f32,
+    font_system: &mut FontSystem,
+) -> ParagraphBuffer {
+    let mut metrics = Metrics::new(style.font_size_px, style.line_height_px);
     if metrics.line_height <= 0.0 {
         metrics.line_height = metrics.font_size.max(1.0);
     }
 
     let mut buffer = Buffer::new(font_system, metrics);
-    buffer.set_size(Some(width), None);
+    // Indent shrinks the available text width so wrapped lines don't
+    // collide with the page's content area to the right of the marker.
+    let usable_width = (width - indent_left).max(1.0);
+    buffer.set_size(Some(usable_width), None);
 
     let mut default_attrs = Attrs::new()
-        .family(Family::Name(&block.style.font_family))
-        .weight(Weight(block.style.weight))
-        .style(if block.style.italic {
+        .family(Family::Name(&style.font_family))
+        .weight(Weight(style.weight))
+        .style(if style.italic {
             Style::Italic
         } else {
             Style::Normal
         });
-    if let Some((r, g, b)) = block.style.color {
+    if let Some((r, g, b)) = style.color {
         default_attrs = default_attrs.color(Color::rgb(r, g, b));
     }
 
-    let alignment = match block.style.align {
+    let alignment = match style.align {
         TextAlign::Start => None,
         TextAlign::End => Some(cosmic_text::Align::End),
         TextAlign::Center => Some(cosmic_text::Align::Center),
         TextAlign::Justify => Some(cosmic_text::Align::Justified),
     };
 
-    if block.runs.is_empty() {
+    if runs.is_empty() {
         buffer.set_text("", &default_attrs, Shaping::Advanced, alignment);
     } else {
         // Build (text, Attrs) spans. We must materialise per-run family
         // strings so the borrow lives as long as the call.
-        let families: Vec<String> = block
-            .runs
+        let families: Vec<String> = runs
             .iter()
             .map(|r| {
                 r.style
                     .family
                     .clone()
-                    .unwrap_or_else(|| block.style.font_family.clone())
+                    .unwrap_or_else(|| style.font_family.clone())
             })
             .collect();
 
-        let spans: Vec<(&str, Attrs<'_>)> = block
-            .runs
+        let spans: Vec<(&str, Attrs<'_>)> = runs
             .iter()
             .zip(families.iter())
             .map(|(run, fam)| {
@@ -110,23 +155,155 @@ fn shape_block(block: &Block, width: f32, font_system: &mut FontSystem) -> Block
         );
     }
 
-    // Force shaping & layout so `layout_runs` returns final lines.
     buffer.shape_until_scroll(font_system, false);
 
-    // Compute total height by walking layout runs.
     let total_height: f32 = buffer.layout_runs().map(|run| run.line_height).sum();
 
-    BlockBuffer {
+    ParagraphBuffer {
         buffer,
         total_height,
-        margin_top: block.style.margin_top,
-        margin_bottom: block.style.margin_bottom,
+        margin_top: style.margin_top,
+        margin_bottom: style.margin_bottom,
+        indent_left,
     }
 }
 
-/// Pack pre-shaped blocks into pages, respecting `inner_height`. Blocks
-/// can split mid-paragraph at line boundaries; we never split within a
-/// shaped line.
+/// Resolve and decode an `<img>`. On any failure we emit a placeholder
+/// `ImageBuffer` (with `rgba = None`) so the chapter still renders.
+fn resolve_image(
+    src: &str,
+    chapter_base_path: &str,
+    book: &mut dyn BookSource,
+    inner_width: f32,
+    inner_height: f32,
+) -> ImageBuffer {
+    if src.is_empty() {
+        tracing::warn!("layout: <img> with empty src; using placeholder");
+        return placeholder(src);
+    }
+
+    let resolved = resolve_path(src, chapter_base_path);
+    let bytes = match book.resource(&resolved) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(
+                src = %src,
+                resolved = %resolved,
+                ?err,
+                "layout: failed to resolve <img> resource; using placeholder"
+            );
+            return placeholder(src);
+        }
+    };
+
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(img) => img.to_rgba8(),
+        Err(err) => {
+            tracing::warn!(
+                src = %src,
+                resolved = %resolved,
+                error = %err,
+                "layout: failed to decode <img>; using placeholder"
+            );
+            return placeholder(src);
+        }
+    };
+
+    let intrinsic_w = decoded.width();
+    let intrinsic_h = decoded.height();
+    let (display_w, display_h) = fit_to(
+        intrinsic_w as f32,
+        intrinsic_h as f32,
+        inner_width,
+        inner_height,
+    );
+
+    ImageBuffer {
+        src: src.to_owned(),
+        rgba: Some(Arc::new(decoded.into_raw())),
+        intrinsic_w,
+        intrinsic_h,
+        display_w,
+        display_h,
+        margin_top: IMAGE_MARGIN,
+        margin_bottom: IMAGE_MARGIN,
+    }
+}
+
+fn placeholder(src: &str) -> ImageBuffer {
+    ImageBuffer {
+        src: src.to_owned(),
+        rgba: None,
+        intrinsic_w: PLACEHOLDER_W as u32,
+        intrinsic_h: PLACEHOLDER_H as u32,
+        display_w: PLACEHOLDER_W,
+        display_h: PLACEHOLDER_H,
+        margin_top: IMAGE_MARGIN,
+        margin_bottom: IMAGE_MARGIN,
+    }
+}
+
+/// Scale `(w, h)` down (preserving aspect) so it fits inside `(max_w,
+/// max_h)`. Never scales up.
+fn fit_to(w: f32, h: f32, max_w: f32, max_h: f32) -> (f32, f32) {
+    if w <= 0.0 || h <= 0.0 || max_w <= 0.0 || max_h <= 0.0 {
+        return (w.max(1.0), h.max(1.0));
+    }
+    let scale_w = if w > max_w { max_w / w } else { 1.0 };
+    let scale_h = if h > max_h { max_h / h } else { 1.0 };
+    let s = scale_w.min(scale_h);
+    ((w * s).max(1.0), (h * s).max(1.0))
+}
+
+/// Resolve an `<img src>` against the chapter's archive-internal base
+/// path. Returns the absolute archive-internal path the resource lives at.
+///
+/// Rules (covers the common cases — see PR3.5 brief):
+/// - Strip `#fragment` and `?query`.
+/// - Leading `./` stripped.
+/// - Leading `/` → absolute (drop the slash).
+/// - Otherwise: join with `dirname(base_path)` and collapse `..` segments.
+pub(super) fn resolve_path(src: &str, base_path: &str) -> String {
+    let mut s = src;
+    if let Some(idx) = s.find('#') {
+        s = &s[..idx];
+    }
+    if let Some(idx) = s.find('?') {
+        s = &s[..idx];
+    }
+    let s = s.trim_start_matches("./");
+
+    if let Some(rest) = s.strip_prefix('/') {
+        return collapse_segments(rest);
+    }
+
+    // Take the chapter directory (everything up to and including the last '/').
+    let dir = match base_path.rfind('/') {
+        Some(idx) => &base_path[..=idx],
+        None => "",
+    };
+    let combined = format!("{dir}{s}");
+    collapse_segments(&combined)
+}
+
+/// Collapse `.` and `..` segments in a `/`-separated archive path.
+fn collapse_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out.join("/")
+}
+
+/// Pack pre-shaped blocks into pages, respecting `inner_height`. Paragraph
+/// blocks can split mid-paragraph at line boundaries; image blocks are
+/// atomic — they roll to a new page if they don't fit.
 fn pack_pages(blocks: &[BlockBuffer], inner_height: f32) -> Vec<Page> {
     let mut pages: Vec<Page> = Vec::new();
     if inner_height <= 0.0 || blocks.is_empty() {
@@ -138,23 +315,12 @@ fn pack_pages(blocks: &[BlockBuffer], inner_height: f32) -> Vec<Page> {
     let mut page_has_content = false;
 
     for (block_idx, block) in blocks.iter().enumerate() {
-        // Collect line heights for this block.
-        let line_heights: Vec<f32> = block
-            .buffer
-            .layout_runs()
-            .map(|run| run.line_height)
-            .collect();
-        if line_heights.is_empty() {
-            continue;
-        }
-
         let margin_top = if page_has_content {
-            block.margin_top
+            block.margin_top()
         } else {
             0.0
         };
         if y + margin_top > inner_height && page_has_content {
-            // Margin alone won't fit — flush page first.
             flush_page(&mut pages, &mut current_slices);
             y = 0.0;
             page_has_content = false;
@@ -162,66 +328,32 @@ fn pack_pages(blocks: &[BlockBuffer], inner_height: f32) -> Vec<Page> {
             y += margin_top;
         }
 
-        let mut line_idx = 0usize;
-        while line_idx < line_heights.len() {
-            let line_h = line_heights[line_idx];
-            // Will this single line fit on the current page?
-            if y + line_h > inner_height && page_has_content {
-                flush_page(&mut pages, &mut current_slices);
-                y = 0.0;
-                page_has_content = false;
+        match block {
+            BlockBuffer::Paragraph(p) => {
+                pack_paragraph(
+                    p,
+                    block_idx,
+                    inner_height,
+                    &mut pages,
+                    &mut current_slices,
+                    &mut y,
+                    &mut page_has_content,
+                );
             }
-
-            // Greedy-pack lines of this block into the current page.
-            let slice_start = line_idx;
-            let slice_y = y;
-            let mut slice_h = 0.0_f32;
-            while line_idx < line_heights.len() {
-                let lh = line_heights[line_idx];
-                if y + lh > inner_height && page_has_content {
-                    break;
-                }
-                y += lh;
-                slice_h += lh;
-                line_idx += 1;
-                page_has_content = true;
-            }
-
-            if line_idx > slice_start {
-                current_slices.push(BlockSlice {
-                    block_index: block_idx,
-                    line_start: slice_start,
-                    line_end: line_idx,
-                    y_offset: slice_y,
-                    height: slice_h,
-                });
-            } else {
-                // We couldn't fit even one line on a page that already
-                // had content — push the page and retry. If the page is
-                // empty (a single line larger than the viewport) we must
-                // still place it to make progress, so allow oversize.
-                if page_has_content {
-                    flush_page(&mut pages, &mut current_slices);
-                    y = 0.0;
-                    page_has_content = false;
-                } else {
-                    let lh = line_heights[line_idx];
-                    current_slices.push(BlockSlice {
-                        block_index: block_idx,
-                        line_start: line_idx,
-                        line_end: line_idx + 1,
-                        y_offset: y,
-                        height: lh,
-                    });
-                    y += lh;
-                    line_idx += 1;
-                    page_has_content = true;
-                }
+            BlockBuffer::Image(img) => {
+                pack_image(
+                    img,
+                    block_idx,
+                    inner_height,
+                    &mut pages,
+                    &mut current_slices,
+                    &mut y,
+                    &mut page_has_content,
+                );
             }
         }
 
-        // Block fully placed; account for bottom margin.
-        y += block.margin_bottom;
+        y += block.margin_bottom();
     }
 
     if page_has_content {
@@ -231,6 +363,105 @@ fn pack_pages(blocks: &[BlockBuffer], inner_height: f32) -> Vec<Page> {
     pages
 }
 
+fn pack_paragraph(
+    block: &ParagraphBuffer,
+    block_idx: usize,
+    inner_height: f32,
+    pages: &mut Vec<Page>,
+    current_slices: &mut Vec<BlockSlice>,
+    y: &mut f32,
+    page_has_content: &mut bool,
+) {
+    let line_heights: Vec<f32> = block
+        .buffer
+        .layout_runs()
+        .map(|run| run.line_height)
+        .collect();
+    if line_heights.is_empty() {
+        return;
+    }
+
+    let mut line_idx = 0usize;
+    while line_idx < line_heights.len() {
+        let line_h = line_heights[line_idx];
+        if *y + line_h > inner_height && *page_has_content {
+            flush_page(pages, current_slices);
+            *y = 0.0;
+            *page_has_content = false;
+        }
+
+        let slice_start = line_idx;
+        let slice_y = *y;
+        let mut slice_h = 0.0_f32;
+        while line_idx < line_heights.len() {
+            let lh = line_heights[line_idx];
+            if *y + lh > inner_height && *page_has_content {
+                break;
+            }
+            *y += lh;
+            slice_h += lh;
+            line_idx += 1;
+            *page_has_content = true;
+        }
+
+        if line_idx > slice_start {
+            current_slices.push(BlockSlice {
+                block_index: block_idx,
+                line_start: slice_start,
+                line_end: line_idx,
+                y_offset: slice_y,
+                height: slice_h,
+            });
+        } else if *page_has_content {
+            flush_page(pages, current_slices);
+            *y = 0.0;
+            *page_has_content = false;
+        } else {
+            // Single line larger than the viewport — place it anyway.
+            let lh = line_heights[line_idx];
+            current_slices.push(BlockSlice {
+                block_index: block_idx,
+                line_start: line_idx,
+                line_end: line_idx + 1,
+                y_offset: *y,
+                height: lh,
+            });
+            *y += lh;
+            line_idx += 1;
+            *page_has_content = true;
+        }
+    }
+}
+
+fn pack_image(
+    img: &ImageBuffer,
+    block_idx: usize,
+    inner_height: f32,
+    pages: &mut Vec<Page>,
+    current_slices: &mut Vec<BlockSlice>,
+    y: &mut f32,
+    page_has_content: &mut bool,
+) {
+    let h = img.display_h.max(1.0);
+    if *y + h > inner_height && *page_has_content {
+        flush_page(pages, current_slices);
+        *y = 0.0;
+        *page_has_content = false;
+    }
+    // We never split an image. If it still doesn't fit on a fresh page
+    // (e.g. caller passed an oversized fit), we place it anyway and
+    // accept the overflow — pagination must make progress.
+    current_slices.push(BlockSlice {
+        block_index: block_idx,
+        line_start: 0,
+        line_end: 1,
+        y_offset: *y,
+        height: h,
+    });
+    *y += h;
+    *page_has_content = true;
+}
+
 fn flush_page(pages: &mut Vec<Page>, slices: &mut Vec<BlockSlice>) {
     if slices.is_empty() {
         return;
@@ -238,4 +469,53 @@ fn flush_page(pages: &mut Vec<Page>, slices: &mut Vec<BlockSlice>) {
     pages.push(Page {
         slices: std::mem::take(slices),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_relative_simple() {
+        assert_eq!(
+            resolve_path("foo.png", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/text/foo.png"
+        );
+    }
+
+    #[test]
+    fn resolve_dotdot() {
+        assert_eq!(
+            resolve_path("../images/foo.jpg", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/images/foo.jpg"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute() {
+        assert_eq!(
+            resolve_path("/OEBPS/foo.png", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/foo.png"
+        );
+    }
+
+    #[test]
+    fn resolve_strips_fragment_and_query() {
+        assert_eq!(
+            resolve_path("foo.png#frag", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/text/foo.png"
+        );
+        assert_eq!(
+            resolve_path("foo.png?v=1", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/text/foo.png"
+        );
+    }
+
+    #[test]
+    fn resolve_dot_slash() {
+        assert_eq!(
+            resolve_path("./foo.png", "OEBPS/text/ch1.xhtml"),
+            "OEBPS/text/foo.png"
+        );
+    }
 }

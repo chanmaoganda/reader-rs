@@ -18,7 +18,9 @@
 
 use cosmic_text::{Color as CtColor, FontSystem, SwashCache, SwashContent};
 
-use crate::layout::{LaidOutChapter, Page, Theme, Viewport};
+use crate::layout::{
+    BlockBuffer, ImageBuffer, LaidOutChapter, Page, ParagraphBuffer, Theme, Viewport,
+};
 
 /// One rasterized page: dimensions plus the RGBA8 pixel buffer.
 #[derive(Debug, Clone)]
@@ -72,51 +74,198 @@ pub(crate) fn render_page(
         let Some(block) = chapter.blocks().get(slice.block_index) else {
             continue;
         };
-        // The slice records its `y_offset` within the page's inner box; the
-        // layout engine starts each block at the top of its slice. We need
-        // to compensate for the position cosmic-text records inside the
-        // Buffer, which is relative to the Buffer's top.
-        let mut block_top: Option<f32> = None;
-        for (line_idx, run) in block.buffer().layout_runs().enumerate() {
-            if line_idx < slice.line_start {
-                continue;
-            }
-            if line_idx >= slice.line_end {
-                break;
-            }
-            // Anchor the slice: the first included line's `line_top` becomes
-            // y=0 of the slice, and subsequent lines stack relative to it.
-            let block_top = *block_top.get_or_insert(run.line_top);
-            let line_top_within_slice = run.line_top - block_top;
-            // Baseline-to-top distance for this line — still in the layout's
-            // logical units. cosmic-text's `LayoutGlyph::physical(offset,
-            // scale)` only scales the glyph's intra-line coordinates and
-            // *adds* `offset` unscaled, so any logical-pixel quantities we
-            // contribute (page margin, slice anchor, baseline shift) must be
-            // pre-multiplied by `scale` before being passed in.
-            let baseline_y_logical =
-                margin + slice.y_offset + (run.line_y - run.line_top) + line_top_within_slice;
-            let baseline_y = baseline_y_logical * scale;
-            let pen_x = margin * scale;
-
-            for glyph in run.glyphs {
-                let physical = glyph.physical((pen_x, baseline_y), scale);
-                let glyph_color = glyph.color_opt.unwrap_or(default_color);
-                draw_glyph(
+        match block {
+            BlockBuffer::Paragraph(p) => {
+                draw_paragraph_slice(
                     &mut img,
+                    p,
+                    slice,
+                    margin,
+                    scale,
+                    default_color,
+                    theme.bg_color,
                     font_system,
                     swash_cache,
-                    physical.cache_key,
-                    physical.x,
-                    physical.y,
-                    glyph_color,
-                    theme.bg_color,
                 );
+            }
+            BlockBuffer::Image(image) => {
+                draw_image_slice(&mut img, image, slice, margin, scale, theme.fg_color);
             }
         }
     }
 
     img
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_paragraph_slice(
+    img: &mut PageImage,
+    block: &ParagraphBuffer,
+    slice: &crate::layout::BlockSlice,
+    margin: f32,
+    scale: f32,
+    default_color: CtColor,
+    bg: CtColor,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+) {
+    // Anchor the slice: the first included line's `line_top` becomes y=0
+    // of the slice, and subsequent lines stack relative to it.
+    let mut block_top: Option<f32> = None;
+    for (line_idx, run) in block.buffer().layout_runs().enumerate() {
+        if line_idx < slice.line_start {
+            continue;
+        }
+        if line_idx >= slice.line_end {
+            break;
+        }
+        let block_top = *block_top.get_or_insert(run.line_top);
+        let line_top_within_slice = run.line_top - block_top;
+        // Baseline-to-top distance for this line — still in the layout's
+        // logical units. cosmic-text's `LayoutGlyph::physical(offset, scale)`
+        // only scales the glyph's intra-line coordinates and *adds* `offset`
+        // unscaled, so any logical-pixel quantities we contribute (page
+        // margin, slice anchor, baseline shift) must be pre-multiplied by
+        // `scale` before being passed in.
+        let baseline_y_logical =
+            margin + slice.y_offset + (run.line_y - run.line_top) + line_top_within_slice;
+        let baseline_y = baseline_y_logical * scale;
+        let pen_x = (margin + block.indent_left) * scale;
+
+        for glyph in run.glyphs {
+            let physical = glyph.physical((pen_x, baseline_y), scale);
+            let glyph_color = glyph.color_opt.unwrap_or(default_color);
+            draw_glyph(
+                img,
+                font_system,
+                swash_cache,
+                physical.cache_key,
+                physical.x,
+                physical.y,
+                glyph_color,
+                bg,
+            );
+        }
+    }
+}
+
+/// Blit a decoded image (or a placeholder rect for missing/undecodable
+/// images) into the page buffer.
+fn draw_image_slice(
+    img: &mut PageImage,
+    block: &ImageBuffer,
+    slice: &crate::layout::BlockSlice,
+    margin: f32,
+    scale: f32,
+    border_color: CtColor,
+) {
+    let dst_x0 = (margin * scale) as i32;
+    let dst_y0 = ((margin + slice.y_offset) * scale) as i32;
+    let dst_w = (block.display_w * scale).max(1.0) as i32;
+    let dst_h = (block.display_h * scale).max(1.0) as i32;
+
+    match block.rgba.as_ref() {
+        Some(pixels) => {
+            blit_rgba_scaled(
+                img,
+                pixels,
+                block.intrinsic_w,
+                block.intrinsic_h,
+                dst_x0,
+                dst_y0,
+                dst_w,
+                dst_h,
+            );
+        }
+        None => {
+            draw_placeholder_box(img, dst_x0, dst_y0, dst_w, dst_h, border_color);
+        }
+    }
+}
+
+/// Nearest-neighbour blit of an RGBA8 source into the page buffer at
+/// `(dst_x0, dst_y0)`, scaled to `(dst_w, dst_h)`. Alpha is treated as
+/// opaque (ignored). Pixels outside the buffer are clipped.
+#[allow(clippy::too_many_arguments)]
+fn blit_rgba_scaled(
+    img: &mut PageImage,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x0: i32,
+    dst_y0: i32,
+    dst_w: i32,
+    dst_h: i32,
+) {
+    if src_w == 0 || src_h == 0 || dst_w <= 0 || dst_h <= 0 {
+        return;
+    }
+    let buf_w = img.width as i32;
+    let buf_h = img.height as i32;
+    let src_w_i = src_w as i32;
+    let src_h_i = src_h as i32;
+    for y in 0..dst_h {
+        let py = dst_y0 + y;
+        if py < 0 || py >= buf_h {
+            continue;
+        }
+        // Map dst row → src row (nearest).
+        let sy = ((y as i64 * src_h_i as i64) / dst_h as i64) as i32;
+        let sy = sy.clamp(0, src_h_i - 1);
+        let src_row = (sy as usize) * (src_w as usize) * 4;
+        let dst_row = (py as usize) * (img.width as usize) * 4;
+        for x in 0..dst_w {
+            let px = dst_x0 + x;
+            if px < 0 || px >= buf_w {
+                continue;
+            }
+            let sx = ((x as i64 * src_w_i as i64) / dst_w as i64) as i32;
+            let sx = sx.clamp(0, src_w_i - 1);
+            let si = src_row + (sx as usize) * 4;
+            let di = dst_row + (px as usize) * 4;
+            img.pixels[di] = src[si];
+            img.pixels[di + 1] = src[si + 1];
+            img.pixels[di + 2] = src[si + 2];
+            img.pixels[di + 3] = 0xFF;
+        }
+    }
+}
+
+/// Draw a thin-bordered rectangle for image placeholders. Border in
+/// `border_color`; interior left untouched (so the page background shows
+/// through).
+fn draw_placeholder_box(
+    img: &mut PageImage,
+    dst_x0: i32,
+    dst_y0: i32,
+    dst_w: i32,
+    dst_h: i32,
+    border_color: CtColor,
+) {
+    if dst_w <= 0 || dst_h <= 0 {
+        return;
+    }
+    let (r, g, b, _a) = border_color.as_rgba_tuple();
+    let buf_w = img.width as i32;
+    let buf_h = img.height as i32;
+    let put = |img: &mut PageImage, x: i32, y: i32| {
+        if x < 0 || x >= buf_w || y < 0 || y >= buf_h {
+            return;
+        }
+        let i = ((y as usize) * (img.width as usize) + (x as usize)) * 4;
+        img.pixels[i] = r;
+        img.pixels[i + 1] = g;
+        img.pixels[i + 2] = b;
+        img.pixels[i + 3] = 0xFF;
+    };
+    for x in dst_x0..(dst_x0 + dst_w) {
+        put(img, x, dst_y0);
+        put(img, x, dst_y0 + dst_h - 1);
+    }
+    for y in dst_y0..(dst_y0 + dst_h) {
+        put(img, dst_x0, y);
+        put(img, dst_x0 + dst_w - 1, y);
+    }
 }
 
 fn fill_bg(img: &mut PageImage, color: CtColor) {
@@ -264,8 +413,31 @@ fn blend(dst: &mut [u8], sr: u8, sg: u8, sb: u8, sa: u8, br: u8, bg: u8, bb: u8)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::ChapterContent;
+    use crate::format::{BookSource, ChapterContent, ChapterRef, Metadata};
     use crate::layout::{FontSystem as LayoutFontSystem, paginate};
+
+    /// Test stub: a `BookSource` with no resources. Image-bearing tests
+    /// live in `tests/lists_and_images.rs` against a real fixture EPUB.
+    struct NoResources;
+    impl BookSource for NoResources {
+        fn metadata(&self) -> &Metadata {
+            unimplemented!("test stub")
+        }
+        fn spine(&self) -> &[ChapterRef] {
+            &[]
+        }
+        fn chapter(&mut self, _index: usize) -> crate::Result<ChapterContent> {
+            unimplemented!("test stub")
+        }
+        fn cover(&mut self) -> crate::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn resource(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+            Err(crate::Error::MissingResource {
+                path: path.to_owned(),
+            })
+        }
+    }
 
     fn fixture_chapter(xhtml: &str) -> ChapterContent {
         ChapterContent {
@@ -287,7 +459,8 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body><p>Hello world.</p></body></html>"#,
         );
-        let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
+        let mut book = NoResources;
+        let out = paginate(&mut book, &chapter, viewport, &theme, &mut fs).expect("paginate");
         assert!(out.page_count() >= 1);
         let page = out.page(0).expect("page 0");
         let img = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);
@@ -321,7 +494,8 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body><p>中文测试</p></body></html>"#,
         );
-        let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
+        let mut book = NoResources;
+        let out = paginate(&mut book, &chapter, viewport, &theme, &mut fs).expect("paginate");
         let page = out.page(0).expect("page 0");
         let img = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);
         let bg = theme.bg_color.as_rgba_tuple();
@@ -358,7 +532,8 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body><p>One.</p><p>Two.</p><p>Three.</p></body></html>"#,
         );
-        let out = paginate(&chapter, viewport, &theme, &mut fs).expect("paginate");
+        let mut book = NoResources;
+        let out = paginate(&mut book, &chapter, viewport, &theme, &mut fs).expect("paginate");
         let page = out.page(0).expect("page 0");
 
         let img1 = render_page(page, &out, viewport, &theme, 1.0, &mut fs, &mut cache);

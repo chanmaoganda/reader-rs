@@ -169,7 +169,7 @@ fn paginate_one(
         }
     };
 
-    match paginate(&chapter, viewport, theme, font_system) {
+    match paginate(book, &chapter, viewport, theme, font_system) {
         Ok(laid_out) => {
             tracing::debug!(
                 pages = laid_out.page_count(),

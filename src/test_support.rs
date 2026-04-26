@@ -72,7 +72,15 @@ fn build_fixture() -> std::io::Result<PathBuf> {
     zip.start_file("OEBPS/ch03.xhtml", deflated)?;
     zip.write_all(CH03_XHTML.as_bytes())?;
 
+    zip.start_file("OEBPS/ch04.xhtml", deflated)?;
+    zip.write_all(CH04_XHTML.as_bytes())?;
+
     zip.start_file("OEBPS/cover.png", stored)?;
+    zip.write_all(COVER_PNG)?;
+
+    // ch04 references this image; reuse the cover bytes (they're a valid
+    // 1x1 PNG, which is all we need to exercise the decode path).
+    zip.start_file("OEBPS/images/embedded.png", stored)?;
     zip.write_all(COVER_PNG)?;
 
     zip.finish()?;
@@ -114,12 +122,15 @@ const CONTENT_OPF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <item id="ch01" href="ch01.xhtml" media-type="application/xhtml+xml"/>
     <item id="ch02" href="ch02.xhtml" media-type="application/xhtml+xml"/>
     <item id="ch03" href="ch03.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch04" href="ch04.xhtml" media-type="application/xhtml+xml"/>
     <item id="cover-image" href="cover.png" media-type="image/png" properties="cover-image"/>
+    <item id="embedded-image" href="images/embedded.png" media-type="image/png"/>
   </manifest>
   <spine toc="ncx">
     <itemref idref="ch01"/>
     <itemref idref="ch02"/>
     <itemref idref="ch03"/>
+    <itemref idref="ch04"/>
   </spine>
 </package>
 "#;
@@ -180,6 +191,20 @@ const CH03_XHTML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Chapter Three</title></head>
 <body><h1>Chapter Three</h1><p>中文测试 — UTF-8 round-trip.</p></body>
+</html>
+"#;
+
+/// Chapter Four: exercises lists (`<ul>`, `<ol>`) and an embedded image.
+/// Used by `tests/lists_and_images.rs` (PR3.5).
+const CH04_XHTML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Chapter Four</title></head>
+<body>
+<h1>Chapter Four</h1>
+<ul><li>alpha</li><li>beta</li></ul>
+<ol><li>one</li><li>two</li></ol>
+<img src="images/embedded.png"/>
+</body>
 </html>
 "#;
 

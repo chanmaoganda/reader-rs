@@ -25,7 +25,42 @@ fn paginate_fixture_chapter(c: &mut Criterion) {
 
     c.bench_function("paginate_fixture_chapter", |b| {
         b.iter(|| {
-            let out = paginate(&chapter, viewport, &theme, &mut font_system)
+            let out = paginate(&mut book, &chapter, viewport, &theme, &mut font_system)
+                .expect("paginate must succeed");
+            std::hint::black_box(out.page_count());
+        });
+    });
+}
+
+/// PR3.5: paginate the first image-bearing chapter of the canonical CJK
+/// EPUB. Skipped automatically when the file is absent so CI stays green.
+fn paginate_canonical_image_chapter(c: &mut Criterion) {
+    let path = "/home/ethan/Documents/china-in-map/《地图中的中国通史》[上下册].epub";
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+    let mut book = EpubSource::open(path).expect("open canonical");
+    let viewport = Viewport {
+        width: 800.0,
+        height: 1200.0,
+    };
+    let theme = Theme::default();
+    let mut font_system = FontSystem::new();
+
+    // Find an image-bearing chapter; the brief suggests ch004.
+    let target_index = (0..book.spine().len()).find(|i| {
+        book.chapter(*i)
+            .map(|c| c.xhtml.contains("<img"))
+            .unwrap_or(false)
+    });
+    let Some(idx) = target_index else {
+        return;
+    };
+    let chapter = book.chapter(idx).expect("image chapter");
+
+    c.bench_function("paginate_canonical_image_chapter", |b| {
+        b.iter(|| {
+            let out = paginate(&mut book, &chapter, viewport, &theme, &mut font_system)
                 .expect("paginate must succeed");
             std::hint::black_box(out.page_count());
         });
@@ -47,8 +82,8 @@ fn rasterize_page(c: &mut Criterion) {
     let theme = Theme::default();
     let chapter = book.chapter(0).expect("chapter 0");
     let mut paginate_fs = FontSystem::new();
-    let laid_out =
-        paginate(&chapter, viewport, &theme, &mut paginate_fs).expect("paginate must succeed");
+    let laid_out = paginate(&mut book, &chapter, viewport, &theme, &mut paginate_fs)
+        .expect("paginate must succeed");
     assert!(laid_out.page_count() >= 1, "fixture chapter has pages");
 
     // Hot path: the FontSystem and SwashCache are warm by the time the
@@ -82,5 +117,10 @@ fn rasterize_page(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, paginate_fixture_chapter, rasterize_page);
+criterion_group!(
+    benches,
+    paginate_fixture_chapter,
+    paginate_canonical_image_chapter,
+    rasterize_page
+);
 criterion_main!(benches);

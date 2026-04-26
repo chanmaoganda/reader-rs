@@ -32,7 +32,7 @@ fn paginates_each_chapter_of_fixture() {
 
     for i in 0..spine_len {
         let chapter = book.chapter(i).expect("chapter");
-        let chapter_out = paginate(&chapter, viewport, &theme, &mut font_system)
+        let chapter_out = paginate(&mut book, &chapter, viewport, &theme, &mut font_system)
             .unwrap_or_else(|err| panic!("paginate ch{i} failed: {err}"));
         assert!(
             chapter_out.page_count() >= 1,
@@ -56,7 +56,8 @@ fn cjk_chapter_has_no_replacement_glyphs() {
 
     // ch03 in the fixture contains 中文测试.
     let chapter = book.chapter(2).expect("ch03");
-    let out = paginate(&chapter, viewport, &theme, &mut font_system).expect("paginate ch03");
+    let out =
+        paginate(&mut book, &chapter, viewport, &theme, &mut font_system).expect("paginate ch03");
 
     let mut all_text = String::new();
     for i in 0..out.page_count() {
@@ -104,7 +105,7 @@ fn paginates_canonical_cjk_epub() {
         let chapter = book.chapter(i).expect("chapter");
         let xhtml_len = chapter.xhtml.len();
         let start = std::time::Instant::now();
-        let out = paginate(&chapter, viewport, &theme, &mut font_system)
+        let out = paginate(&mut book, &chapter, viewport, &theme, &mut font_system)
             .unwrap_or_else(|err| panic!("paginate ch{i} ({xhtml_len} bytes) failed: {err}"));
         let elapsed = start.elapsed().as_millis();
         max_chapter_ms = max_chapter_ms.max(elapsed);
@@ -156,7 +157,8 @@ fn rasterizes_canonical_cjk_page() {
     let mut rendered = None;
     for i in 0..spine_len.min(10) {
         let chapter = book.chapter(i).expect("chapter");
-        let out = paginate(&chapter, viewport, &theme, &mut font_system).expect("paginate");
+        let out =
+            paginate(&mut book, &chapter, viewport, &theme, &mut font_system).expect("paginate");
         if out.page_count() == 0 {
             continue;
         }

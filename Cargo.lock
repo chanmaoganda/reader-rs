@@ -3297,6 +3297,7 @@ dependencies = [
  "directories",
  "epub",
  "iced",
+ "image",
  "reader-rs",
  "roxmltree",
  "serde",

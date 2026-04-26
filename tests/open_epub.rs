@@ -25,7 +25,7 @@ fn opens_fixture_via_public_api() {
     assert_eq!(meta.language.as_deref(), Some("en"));
 
     let spine_len = book.spine().len();
-    assert_eq!(spine_len, 3);
+    assert_eq!(spine_len, 4);
 
     for i in 0..spine_len {
         let ch = book.chapter(i).expect("chapter");

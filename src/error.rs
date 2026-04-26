@@ -68,6 +68,19 @@ pub enum Error {
         message: String,
     },
 
+    /// Failed to decode an image referenced by chapter XHTML.
+    ///
+    /// `src` is the value of the `<img>` element's `src` attribute as it
+    /// appeared in the chapter; `message` is the underlying decoder's
+    /// explanation.
+    #[error("failed to decode image {src}: {message}")]
+    ImageDecode {
+        /// The `src` attribute as it appeared in the chapter XHTML.
+        src: String,
+        /// Human-readable explanation from the underlying decoder.
+        message: String,
+    },
+
     /// The background pagination worker died before returning a response,
     /// or its outbound channel was closed unexpectedly.
     #[error("background worker failed: {0}")]

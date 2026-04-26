@@ -208,13 +208,14 @@ mod tests {
     }
 
     #[test]
-    fn spine_has_three_chapters_with_titles() {
+    fn spine_has_chapters_with_ids() {
         let book = EpubSource::open(fixture_path()).expect("open");
         let spine = book.spine();
-        assert_eq!(spine.len(), 3);
+        assert_eq!(spine.len(), 4);
         assert_eq!(spine[0].id, "ch01");
         assert_eq!(spine[1].id, "ch02");
         assert_eq!(spine[2].id, "ch03");
+        assert_eq!(spine[3].id, "ch04");
         // EPUB3 nav doc parsing in `epub` 2.1 only populates `toc` from NCX,
         // so titles may be `None` when the fixture ships only a nav doc.
         // The contract here is: ids always present, titles best-effort.
@@ -223,7 +224,7 @@ mod tests {
     #[test]
     fn each_chapter_round_trips_xhtml() {
         let mut book = EpubSource::open(fixture_path()).expect("open");
-        for i in 0..3 {
+        for i in 0..4 {
             let ch = book
                 .chapter(i)
                 .unwrap_or_else(|e| panic!("chapter {i}: {e}"));
@@ -239,7 +240,7 @@ mod tests {
         match book.chapter(99) {
             Err(Error::InvalidChapter { index, len }) => {
                 assert_eq!(index, 99);
-                assert_eq!(len, 3);
+                assert_eq!(len, 4);
             }
             other => panic!("expected InvalidChapter, got {other:?}"),
         }
